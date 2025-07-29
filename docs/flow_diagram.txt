@@ -1,0 +1,155 @@
+HYPERNYM PORTABLE PROCESSOR FLOW (v2.0)
+=======================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          DATA SOURCES                                    │
+├─────────────────────┬───────────────────┬───────────────┬──────────────┤
+│   Existing SQLite  │   JSON Files     │   CSV Files    │   Raw Text    │
+│   (Different schema)│   (Documents)    │   (Products)   │   (Articles)  │
+└────────┬───────────┴────────┬──────────┴───────┬────────┴──────┬───────┘
+         │                    │                  │               │
+         ▼                    ▼                  ▼               ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    CONVERTERS (examples/ or converters/)                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Current: examples/data_converter.py                                     │
+│  - SimpleConverter class (base converter with common functions)          │
+│  - convert_from_json_file()                                              │
+│  - convert_from_csv()                                                    │
+│  - convert_from_existing_sqlite()                                        │
+│  - convert_with_text_preprocessing()                                     │
+│                                                                          │
+│  Hypothetical converters/ directory:                                     │
+│  - converters/longbench.py     (HuggingFace datasets)                   │
+│  - converters/wikipedia.py     (Wikipedia dumps)                        │
+│  - converters/arxiv.py         (Scientific papers)                      │
+│  - converters/custom_db.py     (Your specific database)                 │
+│                                                                          │
+│  Each converter:                                                         │
+│  1. Reads source format                                                  │
+│  2. Cleans/preprocesses text if needed                                   │
+│  3. Preserves metadata (original IDs, titles, authors, etc.)            │
+│  4. Inserts into samples table                                          │
+│  5. NO CHUNKING NEEDED - send entire documents                          │
+└─────────────────────┬───────────────────────────────────────────────────┘
+                      │
+                      ▼
+         ┌────────────────────────────┐
+         │    SQLite Database         │
+         │  ┌────────────────────┐   │
+         │  │   samples table    │   │  ← Created by converter or processor
+         │  ├────────────────────┤   │
+         │  │ id        │ INTEGER│   │
+         │  │ content   │ TEXT   │   │  ← Full document text
+         │  │ metadata  │ TEXT   │   │  ← JSON with original data
+         │  │ created_at│ TIMESTAMP  │
+         │  └────────────────────┘   │
+         └────────────┬───────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      hypernym_processor.py                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Core Processing:                                                        │
+│  1. Reads from samples table                                             │
+│  2. Sends to Hypernym API v2 ─────────┐                                │
+│  3. Stores comprehensive results       │                                │
+│                                        ▼                                │
+│                            ┌─────────────────────┐                      │
+│                            │   Hypernym API v2   │                      │
+│                            ├─────────────────────┤                      │
+│                            │                     │                      │
+│                            │  Compression Magic  │                      │
+│                            │                     │                      │
+│                            └──────────┬──────────┘                      │
+│                                       │                                 │
+│                                       ▼                                 │
+│  ┌────────────────────────────────────────────────┐                    │
+│  │        hypernym_responses table                │                    │
+│  ├────────────────────────────────────────────────┤                    │
+│  │ id             │ INTEGER PRIMARY KEY          │                    │
+│  │ sample_id      │ links to samples.id          │                    │
+│  │ response_data  │ full API response JSON       │                    │
+│  │ compression_ratio │ actual compression         │                    │
+│  │ processing_time   │ API call duration         │                    │
+│  │ created_at     │ TIMESTAMP                    │                    │
+│  │ api_version    │ '2.0' (current)              │                    │
+│  │ model_name     │ API model used               │                    │
+│  │ parameters     │ API parameters used          │                    │
+│  └────────────────────────────────────────────────┘                    │
+│                                                                          │
+│  Batch Processing Methods:                                               │
+│  - process_batch(batch_size, analysis_mode, ...)                        │
+│  - process_all_samples(batch_size, ...)                                 │
+│  - has_unprocessed_samples()                                             │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         OUTPUT METHODS                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Basic Retrieval:                                                        │
+│  - get_compressed_text(sample_id)  → "Compressed version of text..."    │
+│  - get_hypernym_string(sample_id)  → "[SEGMENT 1 | similarity: 0.82]..." │
+│  - get_segment_details(sample_id)  → [{semantic_category, text, ...}]   │
+│  - get_suggested_text(sample_id)   → "AI suggested version..."          │
+│                                                                          │
+│  Analysis Methods:                                                       │
+│  - get_average_semantic_similarity(sample_id) → 0.845                   │
+│  - get_compression_comparison(sample_id) → {ratio, savings, ...}        │
+│  - get_embeddings(sample_id, embedding_type) → [[0.1, -0.3, ...]]      │
+│  - get_trial_statistics() → {total, processed, success_rate, ...}       │
+│                                                                          │
+│  Advanced Filtering:                                                     │
+│  - get_filtered_segments(sample_id, min_similarity, semantic_category)  │
+│                                                                          │
+│  Response Data Structure (v2):                                           │
+│  {                                                                       │
+│    "status": "success",                                                  │
+│    "data": {                                                             │
+│      "hypernym_version": "0.2.1",                                       │
+│      "compression_ratio": 0.73,                                          │
+│      "suggested_text": "...",                                           │
+│      "segments": [{                                                      │
+│        "semantic_category": "scientific_analysis",                       │
+│        "embedding": [...],                                               │
+│        "semantic_similarity": 0.82,                                      │
+│        "text": "compressed segment text"                                 │
+│      }],                                                                 │
+│      "hypernym_string": "[SEGMENT 1 | similarity: 0.82] ...",          │
+│      "usage": {...}                                                      │
+│    }                                                                     │
+│  }                                                                       │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+KEY FEATURES (v2.0):
+====================
+1. NO CHUNKING REQUIRED - API handles entire documents
+2. Enhanced metadata preservation throughout pipeline
+3. Multiple analysis modes: 'basic', 'detailed', 'comprehensive'
+4. Embeddings support for semantic search/similarity
+5. Advanced filtering by semantic category and similarity thresholds
+6. Batch processing with progress tracking
+7. Self-initializing - creates all tables automatically
+8. Backward compatible with v1 responses
+
+TYPICAL WORKFLOW:
+=================
+1. Choose/create appropriate converter for your data source
+2. Run converter to populate samples table
+3. Initialize HypernymProcessor with your database
+4. Process samples in batches (recommended: 10-50 per batch)
+5. Use output methods to retrieve compressed versions
+6. Filter results by semantic category or similarity as needed
+7. Import/merge reported data into your RAG pipeline directly
+
+PERFORMANCE NOTES:
+==================
+- API calls are rate-limited; batch processing manages this automatically
+- Responses are cached in hypernym_responses table
+- Processing state persists across runs (resume capability)
+- For custom chunking strategies, contact: hi@hypernym.ai
