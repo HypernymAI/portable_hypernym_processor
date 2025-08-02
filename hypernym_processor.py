@@ -20,12 +20,24 @@ import argparse
 import time
 import hashlib
 import random
+import asyncio
+import math
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 import requests
 from dataclasses import dataclass, asdict
 from tqdm import tqdm
 from dotenv import load_dotenv
+import aiohttp
+import aiosqlite
+from asyncio_throttle import Throttler
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TaskProgressColumn, TimeRemainingColumn, TimeElapsedColumn
+from rich.table import Table
+from rich.align import Align
 
 
 # Load environment variables from .env file
@@ -65,6 +77,124 @@ class HypernymResponse:
     segments: List[Dict[str, Any]]
     processing_time: float
     timestamp: str
+
+class AdaptiveConcurrencyManager:
+    """Manages concurrent workers based on API rate limits and performance"""
+    
+    def __init__(self, processor, initial_workers: int = 4):
+        self.processor = processor
+        self.initial_workers = initial_workers
+        self.current_workers = initial_workers
+        self.min_workers = 1
+        self.max_workers = initial_workers  # Will be updated from API
+        self.recommended_workers = initial_workers
+        
+        # Performance tracking
+        self.success_count = 0
+        self.error_count = 0
+        self.rate_limit_count = 0
+        self.total_response_time = 0.0
+        self.last_adjustment = time.time()
+        self.adjustment_interval = 30  # seconds
+        
+        # Rate limit info
+        self.api_limits = None
+        self.last_limit_check = 0
+        self.limit_check_interval = 300  # 5 minutes
+        
+    async def get_rate_limits(self, session: aiohttp.ClientSession) -> Dict[str, Any]:
+        """Query the API for current rate limits"""
+        try:
+            headers = {
+                'X-API-Key': self.processor.api_key,
+                'Content-Type': 'application/json'
+            }
+            
+            # Extract base URL
+            base_url = self.processor.api_url.rsplit('/', 1)[0]
+            limits_url = f"{base_url}/user/rate-limits"
+            
+            async with session.get(limits_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    self.api_limits = data
+                    
+                    # Update max workers based on API recommendation
+                    if 'recommended' in data:
+                        self.max_workers = data['recommended'].get('max_workers', self.initial_workers)
+                        self.recommended_workers = self.max_workers
+                    
+                    # Be conservative - start at 50% of max
+                    self.current_workers = max(1, self.max_workers // 2)
+                    
+                    return data
+        except Exception as e:
+            print(f"⚠️  Could not fetch rate limits: {e}")
+        
+        return None
+    
+    def should_check_limits(self) -> bool:
+        """Check if we should refresh rate limit info"""
+        return time.time() - self.last_limit_check > self.limit_check_interval
+    
+    def record_success(self, response_time: float):
+        """Record a successful request"""
+        self.success_count += 1
+        self.total_response_time += response_time
+    
+    def record_error(self):
+        """Record an error"""
+        self.error_count += 1
+    
+    def record_rate_limit(self):
+        """Record a rate limit event"""
+        self.rate_limit_count += 1
+        # Immediately reduce workers on rate limit
+        self.current_workers = max(self.min_workers, self.current_workers // 2)
+    
+    def get_avg_response_time(self) -> float:
+        """Get average response time"""
+        if self.success_count == 0:
+            return 0.0
+        return self.total_response_time / self.success_count
+    
+    def should_adjust(self) -> bool:
+        """Check if we should adjust worker count"""
+        return time.time() - self.last_adjustment > self.adjustment_interval
+    
+    def adjust_workers(self) -> int:
+        """Adjust worker count based on performance"""
+        if not self.should_adjust():
+            return self.current_workers
+        
+        self.last_adjustment = time.time()
+        
+        # If we hit rate limits, stay conservative
+        if self.rate_limit_count > 0:
+            self.rate_limit_count = 0  # Reset counter
+            return self.current_workers  # Keep reduced count
+        
+        # If high error rate, reduce workers
+        error_rate = self.error_count / max(1, self.success_count + self.error_count)
+        if error_rate > 0.1:  # More than 10% errors
+            self.current_workers = max(self.min_workers, self.current_workers - 1)
+            self.error_count = 0
+            self.success_count = 0
+            return self.current_workers
+        
+        # If good performance and low response times, try increasing
+        avg_response_time = self.get_avg_response_time()
+        if self.success_count > 50 and avg_response_time < 2.0 and error_rate < 0.02:
+            # Increase by 1 worker at a time, up to recommended
+            if self.current_workers < self.recommended_workers:
+                self.current_workers += 1
+        
+        # Reset counters
+        self.error_count = 0
+        self.success_count = 0
+        self.total_response_time = 0.0
+        
+        return self.current_workers
 
 class HypernymProcessor:
     """
@@ -535,6 +665,787 @@ class HypernymProcessor:
             'error': f'Failed after {max_retries} attempts'
         }
     
+    async def process_batch_parallel(self, samples: List[Sample], compression_ratio: float = 0.6,
+                                    similarity: float = 0.75, batch_size: int = 5,
+                                    cooldown: float = 0.5, batch_cooldown: float = 2.0,
+                                    timeout: int = 30, max_retries: int = 3,
+                                    use_cache: bool = True, max_workers: int = 4,
+                                    analysis_mode: str = "partial",
+                                    force_detail_count: Optional[int] = None,
+                                    force_single_segment: bool = True,
+                                    include_embeddings: bool = False,
+                                    filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Process samples in parallel with beautiful progress display"""
+        console = Console()
+        
+        # Create adaptive concurrency manager
+        concurrency_mgr = AdaptiveConcurrencyManager(self, max_workers)
+        
+        # Create progress bars
+        overall_progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]Overall Progress"),
+            BarColumn(bar_width=40),
+            TaskProgressColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            console=console,
+            expand=False
+        )
+        
+        worker_progress = Progress(
+            TextColumn("[bold cyan]{task.fields[worker_name]:>10}"),
+            SpinnerColumn(),
+            BarColumn(bar_width=30),
+            TaskProgressColumn(),
+            TextColumn("[dim]{task.fields[current_sample]}"),
+            console=console,
+            expand=False
+        )
+        
+        # Get historical data from database for accurate averages
+        async def get_historical_stats():
+            """Pull historical compression and similarity data from database"""
+            historical = {
+                'all_compressions': [],
+                'all_similarities': [],
+                'best_compression': 1.0,
+                'best_similarity': 0.0
+            }
+            
+            try:
+                async with aiosqlite.connect(self.db_path) as db:
+                    # Get all compression ratios and similarities
+                    cursor = await db.execute("""
+                        SELECT response_data, compression_ratio 
+                        FROM hypernym_responses 
+                        WHERE compression_ratio > 0
+                    """)
+                    rows = await cursor.fetchall()
+                    
+                    for row in rows:
+                        compression_ratio = row[1]
+                        response_data = json.loads(row[0])
+                        
+                        # Track compression
+                        if compression_ratio > 0:
+                            historical['all_compressions'].append(compression_ratio)
+                            if compression_ratio < historical['best_compression']:
+                                historical['best_compression'] = compression_ratio
+                        
+                        # Extract similarity from response
+                        try:
+                            if 'results' in response_data:
+                                segments = response_data['results'].get('response', {}).get('segments', [])
+                            else:
+                                segments = response_data.get('response', {}).get('segments', [])
+                            
+                            if segments:
+                                similarities = [s.get('semantic_similarity', 0) for s in segments if 'semantic_similarity' in s]
+                                if similarities:
+                                    avg_sim = sum(similarities) / len(similarities)
+                                    historical['all_similarities'].append(avg_sim)
+                                    if avg_sim > historical['best_similarity']:
+                                        historical['best_similarity'] = avg_sim
+                        except:
+                            pass
+                            
+            except Exception as e:
+                console.print(f"[yellow]⚠️  Could not load historical data: {e}[/yellow]")
+            
+            return historical
+        
+        # Stats tracking
+        historical_data = await get_historical_stats()
+        stats = {
+            'processed': 0,
+            'errors': 0,
+            'cache_hits': 0,
+            'rate_limited': 0,
+            'start_time': time.time(),
+            'recent_compressions': [],  # Track last 10 compression ratios
+            'recent_similarities': [],  # Track last 10 similarity scores
+            'all_compressions': historical_data['all_compressions'],  # ALL historical data
+            'all_similarities': historical_data['all_similarities'],  # ALL historical data
+            'best_compression': historical_data['best_compression'],
+            'best_similarity': historical_data['best_similarity'],
+            'animation_frame': 0
+        }
+        
+        # Results storage
+        results = {}
+        
+        def create_average_banners():
+            """Create Megaman-style banners showing averages"""
+            # Calculate averages from historical data
+            avg_compression = sum(stats['all_compressions']) / len(stats['all_compressions']) if stats['all_compressions'] else 0.0
+            avg_similarity = sum(stats['all_similarities']) / len(stats['all_similarities']) if stats['all_similarities'] else 0.0
+            
+            banner_lines = []
+            
+            # Compression banner
+            comp_percent = (1 - avg_compression) * 100
+            comp_bar = "█" * int(comp_percent / 5)  # 20 blocks max
+            banner_lines.append(f"[bold yellow]╔═══════════════════════════╗[/bold yellow]")
+            banner_lines.append(f"[bold yellow]║[/bold yellow] [bold red]⚡ COMPRESSION POWER ⚡[/bold red]   [bold yellow]║[/bold yellow]")
+            banner_lines.append(f"[bold yellow]╠═══════════════════════════╣[/bold yellow]")
+            banner_lines.append(f"[bold yellow]║[/bold yellow] [{comp_bar:<23}] [bold yellow]║[/bold yellow]")
+            banner_lines.append(f"[bold yellow]║[/bold yellow]           [bold white]{comp_percent:>5.1f}%[/bold white]          [bold yellow]║[/bold yellow]")
+            banner_lines.append(f"[bold yellow]╚═══════════════════════════╝[/bold yellow]")
+            
+            banner_lines.append("")  # Spacer
+            
+            # Similarity banner
+            sim_percent = avg_similarity * 100
+            sim_bar = "█" * int(sim_percent / 5)  # 20 blocks max
+            banner_lines.append(f"[bold cyan]╔═══════════════════════════╗[/bold cyan]")
+            banner_lines.append(f"[bold cyan]║[/bold cyan] [bold blue]💎 SIMILARITY SHIELD 💎[/bold blue]   [bold cyan]║[/bold cyan]")
+            banner_lines.append(f"[bold cyan]╠═══════════════════════════╣[/bold cyan]")
+            banner_lines.append(f"[bold cyan]║[/bold cyan] [{sim_bar:<23}] [bold cyan]║[/bold cyan]")
+            banner_lines.append(f"[bold cyan]║[/bold cyan]           [bold white]{sim_percent:>5.1f}%[/bold white]          [bold cyan]║[/bold cyan]")
+            banner_lines.append(f"[bold cyan]╚═══════════════════════════╝[/bold cyan]")
+            
+            banner_lines.append("")  # Spacer
+            
+            # Sample count
+            banner_lines.append(f"[dim]Historical samples: {len(stats['all_compressions']):,}[/dim]")
+            
+            # Combo meter
+            if comp_percent > 70 and sim_percent > 85:
+                banner_lines.append("")
+                banner_lines.append("[bold red on yellow blink]★ MEGA COMBO ACTIVE ★[/bold red on yellow blink]")
+            
+            return "\n".join(banner_lines)
+        
+        def create_best_scores_display():
+            """Create display with 1D violin plots using exact style requested"""
+            lines = []
+            
+            # Calculate statistics for all samples
+            if stats['all_compressions']:
+                comp_values = [(1-x)*100 for x in stats['all_compressions']]  # Convert to percentage
+                comp_min = min(comp_values)
+                comp_max = max(comp_values)
+                comp_avg = sum(comp_values) / len(comp_values)
+                comp_q1 = sorted(comp_values)[len(comp_values)//4]
+                comp_q3 = sorted(comp_values)[3*len(comp_values)//4]
+                
+                # Calculate standard deviation
+                comp_std = (sum((x - comp_avg) ** 2 for x in comp_values) / len(comp_values)) ** 0.5
+                
+                # Create violin plot for compression: ||---===|~~~~|===---||
+                lines.append("[bold red]🏆 COMPRESSION[/bold red]")
+                lines.append(f"Best: [bold yellow]{comp_max:.1f}%[/bold yellow]  Avg: {comp_avg:.1f}%")
+                
+                # Build violin plot: ||---------======|~~~~|==-----||
+                graph_width = 40
+                
+                # Calculate standard error for error bars
+                comp_se = comp_std / (len(comp_values) ** 0.5)
+                
+                # Map values to positions on the graph
+                min_pos = int(comp_min / 100 * graph_width)
+                max_pos = int(comp_max / 100 * graph_width)
+                q1_pos = int(comp_q1 / 100 * graph_width)
+                q3_pos = int(comp_q3 / 100 * graph_width)
+                avg_pos = int(comp_avg / 100 * graph_width)
+                error_left = int((comp_avg - comp_se) / 100 * graph_width)
+                error_right = int((comp_avg + comp_se) / 100 * graph_width)
+                
+                # Build the violin character by character
+                violin = ""
+                i = 0
+                while i < graph_width:
+                    if i == min_pos:
+                        violin += "||"
+                        i += 2
+                    elif i == max_pos and max_pos != min_pos + 1:
+                        violin += "||"
+                        i += 2
+                    elif i == error_left:
+                        violin += "|"
+                        i += 1
+                    elif i == error_right:
+                        violin += "|"
+                        i += 1
+                    elif i > error_left and i < error_right:
+                        violin += "~"
+                        i += 1
+                    elif i >= q1_pos and i <= q3_pos:
+                        violin += "="
+                        i += 1
+                    elif i > min_pos and i < q1_pos:
+                        violin += "-"
+                        i += 1
+                    elif i > q3_pos and i < max_pos:
+                        violin += "-"
+                        i += 1
+                    else:
+                        violin += " "
+                        i += 1
+                
+                lines.append(violin)
+                lines.append(f"0%{' ' * 18}50%{' ' * 17}100%")
+                lines.append("")
+            
+            # Similar for similarity scores
+            if stats['all_similarities']:
+                sim_values = [x*100 for x in stats['all_similarities']]
+                sim_min = min(sim_values)
+                sim_max = max(sim_values)
+                sim_avg = sum(sim_values) / len(sim_values)
+                sim_q1 = sorted(sim_values)[len(sim_values)//4]
+                sim_q3 = sorted(sim_values)[3*len(sim_values)//4]
+                
+                # Calculate standard deviation
+                sim_std = (sum((x - sim_avg) ** 2 for x in sim_values) / len(sim_values)) ** 0.5
+                
+                lines.append("[bold cyan]🏆 SIMILARITY[/bold cyan]")
+                lines.append(f"Best: [bold green]{sim_max:.1f}%[/bold green]  Avg: {sim_avg:.1f}%")
+                
+                # Build violin plot: ||---------======|~~~~|==-----||
+                graph_width = 40
+                
+                # Calculate standard error for error bars
+                sim_se = sim_std / (len(sim_values) ** 0.5)
+                
+                # Map values to positions on the graph
+                min_pos = int(sim_min / 100 * graph_width)
+                max_pos = int(sim_max / 100 * graph_width)
+                q1_pos = int(sim_q1 / 100 * graph_width)
+                q3_pos = int(sim_q3 / 100 * graph_width)
+                avg_pos = int(sim_avg / 100 * graph_width)
+                error_left = int((sim_avg - sim_se) / 100 * graph_width)
+                error_right = int((sim_avg + sim_se) / 100 * graph_width)
+                
+                # Build the violin character by character
+                violin = ""
+                i = 0
+                while i < graph_width:
+                    if i == min_pos:
+                        violin += "||"
+                        i += 2
+                    elif i == max_pos and max_pos != min_pos + 1:
+                        violin += "||"
+                        i += 2
+                    elif i == error_left:
+                        violin += "|"
+                        i += 1
+                    elif i == error_right:
+                        violin += "|"
+                        i += 1
+                    elif i > error_left and i < error_right:
+                        violin += "~"
+                        i += 1
+                    elif i >= q1_pos and i <= q3_pos:
+                        violin += "="
+                        i += 1
+                    elif i > min_pos and i < q1_pos:
+                        violin += "-"
+                        i += 1
+                    elif i > q3_pos and i < max_pos:
+                        violin += "-"
+                        i += 1
+                    else:
+                        violin += " "
+                        i += 1
+                
+                lines.append(violin)
+                lines.append(f"0%{' ' * 18}50%{' ' * 17}100%")
+                lines.append("")
+            
+            lines.append(f"[dim]Total samples: {len(stats['all_compressions']):,}[/dim]")
+            
+            return "\n".join(lines)
+        
+        def create_pinball_animation():
+            """Create display with two ASCII graphs"""
+            # Get last 50 samples for graphs
+            recent_comp = stats['all_compressions'][-50:] if len(stats['all_compressions']) > 50 else stats['all_compressions']
+            recent_sim = stats['all_similarities'][-50:] if len(stats['all_similarities']) > 50 else stats['all_similarities']
+            
+            # Build display
+            display = []
+            display.append("╔" + "═" * 95 + "╗")
+            display.append("║" + " " * 32 + "🎮 HYPERNYM PERFORMANCE 🎮" + " " * 33 + "║")
+            display.append("╠" + "═" * 95 + "╣")
+            display.append("║" + " " * 95 + "║")
+            
+            # Best scores boxes
+            display.append("║ ┌─────────────────────────┐" + " " * 41 + "┌─────────────────────────┐ ║")
+            display.append(f"║ │ 🏆 BEST COMPRESSION: {(1-stats['best_compression'])*100:>3.0f}% │" + " " * 41 + f"│ 🏆 BEST SIMILARITY: {stats['best_similarity']*100:>3.0f}% │ ║")
+            display.append("║ └─────────────────────────┘" + " " * 41 + "└─────────────────────────┘ ║")
+            display.append("║" + " " * 95 + "║")
+            
+            # Graph headers
+            display.append("║ Compression History (last 50 samples)" + " " * 18 + "Similarity History (last 50 samples)   ║")
+            
+            # Create ASCII graphs
+            if recent_comp and recent_sim:
+                # Calculate ranges
+                comp_values = [(1-x)*100 for x in recent_comp]  # Convert to percentage
+                sim_values = [x*100 for x in recent_sim]
+                
+                # Create line graph for compression
+                comp_graph = []
+                for y in range(100, 40, -10):  # 100% to 50% 
+                    line = f"{y:>3}%┤"
+                    for i, val in enumerate(comp_values[-30:]):  # Last 30 points
+                        if i == 0:
+                            line += " "
+                        elif abs(val - y) < 5:
+                            line += "═"
+                        elif comp_values[i-1] < y < val or val < y < comp_values[i-1]:
+                            line += "╱" if val > comp_values[i-1] else "╲"
+                        else:
+                            line += " "
+                    comp_graph.append(line)
+                
+                # Create bar graph for similarity
+                sim_graph = []
+                sim_avg = sum(sim_values) / len(sim_values)
+                sim_min = min(sim_values)
+                sim_max = max(sim_values)
+                
+                for y in range(100, 40, -10):
+                    line = f"{y:>3}%┤"
+                    if sim_min <= y <= sim_max:
+                        if abs(y - sim_avg) < 5:
+                            line += "═" * 30
+                        else:
+                            line += "║" + " " * 28 + "║"
+                    else:
+                        line += " " * 30
+                    sim_graph.append(line)
+                
+                # Display graphs side by side
+                for i in range(len(comp_graph)):
+                    display.append(f"║ {comp_graph[i]:<44} {sim_graph[i]:<45} ║")
+                
+                # Graph bottom line
+                display.append("║    └" + "─" * 30 + " " * 14 + "└" + "─" * 30 + " ║")
+                
+                # Stats
+                comp_avg = sum(comp_values) / len(comp_values)
+                sim_avg = sum(sim_values) / len(sim_values)
+                display.append(f"║    [Min: {min(comp_values):>2.0f}%  Avg: {comp_avg:>2.0f}%  Max: {max(comp_values):>2.0f}%]" + 
+                             " " * 19 + 
+                             f"[Min: {min(sim_values):>2.0f}%  Avg: {sim_avg:>2.0f}%  Max: {max(sim_values):>2.0f}%]   ║")
+            else:
+                # No data message
+                for _ in range(8):
+                    display.append("║" + " " * 95 + "║")
+                display.append("║" + " " * 40 + "[No data yet]" + " " * 42 + "║")
+            
+            display.append("╚" + "═" * 95 + "╝")
+            
+            return "\n".join(display)
+        
+        def make_stats_table():
+            """Create stats table"""
+            table = Table(show_header=False, box=None, padding=(0, 2))
+            
+            elapsed = time.time() - stats['start_time']
+            rate = stats['processed'] / elapsed if elapsed > 0 else 0
+            
+            table.add_row("[green]✓ Processed", f"[bold green]{stats['processed']:,}")
+            table.add_row("[yellow]⚡ Cache Hits", f"[bold yellow]{stats['cache_hits']:,}")
+            table.add_row("[red]✗ Errors", f"[bold red]{stats['errors']:,}")
+            table.add_row("[magenta]⏱ Rate Limited", f"[bold magenta]{stats['rate_limited']:,}")
+            table.add_row("[blue]⚡ Rate", f"[bold blue]{rate:.1f}/sec")
+            table.add_row("[cyan]👷 Workers", f"[bold cyan]{concurrency_mgr.current_workers}/{concurrency_mgr.max_workers}")
+            
+            return table
+        
+        def make_layout(num_workers):
+            """Create the layout"""
+            layout = Layout()
+            
+            layout.split_column(
+                Layout(name="header", size=3),
+                Layout(name="progress", size=num_workers + 3),
+                Layout(name="bottom")
+            )
+            
+            # Split bottom section into stats and best scores
+            layout["bottom"].split_row(
+                Layout(name="stats", ratio=1),
+                Layout(name="best_scores", ratio=1)
+            )
+            
+            layout["header"].update(
+                Panel(
+                    Align.center(
+                        f"[bold][rgb(164,27,27)]H[/rgb(164,27,27)][rgb(247,185,121)]Y[/rgb(247,185,121)][rgb(196,153,21)]P[/rgb(196,153,21)][rgb(68,126,42)]E[/rgb(68,126,42)][rgb(85,140,152)]R[/rgb(85,140,152)][rgb(81,135,220)]N[/rgb(81,135,220)][rgb(167,202,234)]Y[/rgb(167,202,234)][rgb(59,46,98)]M[/rgb(59,46,98)] Parallel Processor[/bold]\n"
+                        f"[dim]{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[/dim]",
+                        vertical="middle"
+                    ),
+                    border_style="blue"
+                )
+            )
+            
+            
+            # Create progress panels layout
+            progress_left = Layout()
+            progress_left.split_column(
+                Layout(Panel(overall_progress, border_style="green"), size=3),
+                Layout(Panel(worker_progress, border_style="cyan"))
+            )
+            
+            # Split progress into left (bars) and right (banners)
+            progress_content = Layout()
+            progress_content.split_row(
+                Layout(progress_left, ratio=3),
+                Layout(
+                    Panel(
+                        Align.center(create_average_banners(), vertical="middle"),
+                        title="[bold magenta]📊 Performance Meters 📊[/bold magenta]",
+                        border_style="magenta"
+                    ),
+                    ratio=1
+                )
+            )
+            layout["progress"].update(progress_content)
+            
+            layout["stats"].update(
+                Panel(
+                    Align.center(make_stats_table(), vertical="middle"),
+                    title="[bold]Statistics[/bold]",
+                    border_style="yellow"
+                )
+            )
+            
+            layout["best_scores"].update(
+                Panel(
+                    Align.center(create_best_scores_display(), vertical="middle"),
+                    title="[bold]🏆 High Scores 🏆[/bold]",
+                    border_style="green"
+                )
+            )
+            
+            return layout
+        
+        async def process_sample_async(self, session, sample, worker_id, worker_task):
+            """Process a single sample asynchronously"""
+            worker_progress.update(
+                worker_task,
+                current_sample=f"Sample #{sample.id:04d}"
+            )
+            
+            # Generate request hash for caching
+            request_hash = self._get_request_hash(
+                sample.content, compression_ratio, similarity,
+                analysis_mode, force_detail_count, force_single_segment, filters
+            )
+            
+            # Check cache
+            if use_cache:
+                cached = self._check_cache(sample.id, request_hash)
+                if cached:
+                    stats['processed'] += 1
+                    stats['cache_hits'] += 1
+                    worker_progress.update(
+                        worker_task,
+                        current_sample=f"Sample #{sample.id:04d} [yellow](cached)[/yellow]"
+                    )
+                    return {
+                        'success': True,
+                        'sample_id': sample.id,
+                        'compression_ratio': cached['compression_ratio'],
+                        'processing_time': cached['processing_time'],
+                        'cached': True,
+                        'response': cached['response_data']
+                    }
+            
+            # Make API request
+            try:
+                headers = {
+                    'X-API-Key': self.api_key,
+                    'Content-Type': 'application/json'
+                }
+                
+                params = {
+                    'min_compression_ratio': compression_ratio,
+                    'min_semantic_similarity': similarity
+                }
+                
+                if analysis_mode != "partial":
+                    params['analysis_mode'] = analysis_mode
+                if force_detail_count is not None:
+                    params['force_detail_count'] = force_detail_count
+                if force_single_segment:
+                    params['force_single_segment'] = force_single_segment
+                if timeout != 60:
+                    params['timeout'] = timeout
+                if include_embeddings:
+                    params['include_embeddings'] = include_embeddings
+                
+                payload = {
+                    'essay_text': sample.content,
+                    'params': params
+                }
+                
+                if filters:
+                    payload['filters'] = filters
+                
+                start_time = time.time()
+                
+                async with session.post(
+                    self.api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=timeout)
+                ) as response:
+                    if response.status == 429:
+                        stats['rate_limited'] += 1
+                        concurrency_mgr.record_rate_limit()
+                        worker_progress.update(
+                            worker_task,
+                            current_sample=f"Sample #{sample.id:04d} [magenta](rate limited)[/magenta]"
+                        )
+                        # Exponential backoff with jitter
+                        backoff = min(60, 2 ** stats.get('rate_limit_retries', 0) + random.random())
+                        await asyncio.sleep(backoff)
+                        stats['rate_limit_retries'] = stats.get('rate_limit_retries', 0) + 1
+                        raise Exception("Rate limited")
+                    
+                    response.raise_for_status()
+                    result = await response.json()
+                
+                processing_time = time.time() - start_time
+                
+                # Extract compression ratio
+                if 'results' in result:
+                    v2_response = result['results']
+                else:
+                    v2_response = result
+                
+                segments = v2_response.get('response', {}).get('segments', [])
+                if segments:
+                    segment_ratios = [s.get('compression_ratio', 0) for s in segments]
+                    actual_ratio = sum(segment_ratios) / len(segment_ratios) if segment_ratios else 0.0
+                else:
+                    actual_ratio = 0.0
+                
+                # Extract similarity scores from segments
+                avg_similarity = 0.75  # default
+                if segments:
+                    similarities = [s.get('semantic_similarity', 0.75) for s in segments if 'semantic_similarity' in s]
+                    if similarities:
+                        avg_similarity = sum(similarities) / len(similarities)
+                
+                # Track recent metrics for animation
+                stats['recent_compressions'].append(actual_ratio)
+                stats['recent_similarities'].append(avg_similarity)
+                # Keep only last 10
+                if len(stats['recent_compressions']) > 10:
+                    stats['recent_compressions'].pop(0)
+                if len(stats['recent_similarities']) > 10:
+                    stats['recent_similarities'].pop(0)
+                
+                # Track ALL metrics for high scores
+                stats['all_compressions'].append(actual_ratio)
+                stats['all_similarities'].append(avg_similarity)
+                
+                # Update high scores
+                if actual_ratio < stats['best_compression']:
+                    stats['best_compression'] = actual_ratio
+                if avg_similarity > stats['best_similarity']:
+                    stats['best_similarity'] = avg_similarity
+                
+                # Save to cache
+                self._save_response(sample.id, request_hash, result, actual_ratio, processing_time)
+                
+                stats['processed'] += 1
+                concurrency_mgr.record_success(processing_time)
+                
+                return {
+                    'success': True,
+                    'sample_id': sample.id,
+                    'compression_ratio': actual_ratio,
+                    'processing_time': processing_time,
+                    'cached': False,
+                    'response': result
+                }
+                
+            except Exception as e:
+                stats['errors'] += 1
+                concurrency_mgr.record_error()
+                worker_progress.update(
+                    worker_task,
+                    current_sample=f"Sample #{sample.id:04d} [red](failed: {str(e)})[/red]"
+                )
+                return {
+                    'success': False,
+                    'sample_id': sample.id,
+                    'error': str(e)
+                }
+        
+        async def worker(self, session, worker_id, queue, overall_task, samples_per_worker):
+            """Worker coroutine"""
+            worker_samples_processed = 0
+            worker_task = worker_progress.add_task(
+                f"Worker {worker_id}",
+                total=samples_per_worker,  # Each worker gets approximately this many
+                worker_name=f"Worker {worker_id}",
+                current_sample="Starting...",
+                samples_count=0
+            )
+            
+            while True:
+                try:
+                    sample = await queue.get()
+                    if sample is None:  # Stop signal
+                        break
+                    
+                    # Process the sample
+                    result = await process_sample_async(self, session, sample, worker_id, worker_task)
+                    results[sample.id] = result
+                    
+                    # Update worker stats
+                    worker_samples_processed += 1
+                    worker_progress.update(
+                        worker_task,
+                        completed=worker_samples_processed,
+                        current_sample=f"Sample #{sample.id:04d} [green](done)[/green]",
+                        samples_count=worker_samples_processed
+                    )
+                    
+                    # Update overall progress
+                    overall_progress.advance(overall_task)
+                    
+                    queue.task_done()
+                    
+                except Exception as e:
+                    worker_progress.update(
+                        worker_task,
+                        current_sample=f"[red]Error: {str(e)}[/red]"
+                    )
+            
+            worker_progress.update(
+                worker_task,
+                current_sample="[green]Complete[/green]"
+            )
+        
+        # Create overall task
+        overall_task = overall_progress.add_task(
+            "Processing samples",
+            total=len(samples)
+        )
+        
+        # Create work queue
+        queue = asyncio.Queue()
+        for sample in samples:
+            await queue.put(sample)
+        
+        # Adjust worker count if we have fewer samples than workers
+        actual_workers = min(max_workers, len(samples))
+        
+        # Create layout
+        layout = make_layout(actual_workers)
+        
+        # Create aiohttp session
+        async with aiohttp.ClientSession() as session:
+            # Query rate limits first
+            console.print("🔍 Querying API rate limits...")
+            limits = await concurrency_mgr.get_rate_limits(session)
+            if limits:
+                console.print(f"✅ Rate limits: {limits['limits']['requests_per_hour']:,}/hour, "
+                            f"recommended {limits['recommended']['max_workers']} workers")
+                console.print(f"🚀 Starting with {concurrency_mgr.current_workers} workers "
+                            f"(will scale up to {concurrency_mgr.max_workers})")
+            else:
+                console.print(f"⚠️  Using default: {concurrency_mgr.current_workers} workers")
+            
+            await asyncio.sleep(1)  # Brief pause to read the info
+            
+            with Live(layout, console=console, refresh_per_second=10):
+                # Start with adaptive number of workers
+                active_workers = min(concurrency_mgr.current_workers, actual_workers)
+                samples_per_worker = max(1, len(samples) // active_workers)
+                
+                workers = [
+                    asyncio.create_task(worker(self, session, i+1, queue, overall_task, samples_per_worker))
+                    for i in range(active_workers)
+                ]
+                
+                # Add stop signals immediately after creating workers
+                for _ in range(active_workers):
+                    await queue.put(None)
+                
+                # Update stats while processing
+                while any(not w.done() for w in workers):
+                    stats['animation_frame'] += 1
+                    
+                    # Update progress section with banners
+                    progress_left = Layout()
+                    progress_left.split_column(
+                        Layout(Panel(overall_progress, border_style="green"), size=3),
+                        Layout(Panel(worker_progress, border_style="cyan"))
+                    )
+                    
+                    progress_content = Layout()
+                    progress_content.split_row(
+                        Layout(progress_left, ratio=3),
+                        Layout(
+                            Panel(
+                                Align.center(create_average_banners(), vertical="middle"),
+                                title="[bold magenta]📊 Performance Meters 📊[/bold magenta]",
+                                border_style="magenta"
+                            ),
+                            ratio=1
+                        )
+                    )
+                    layout["progress"].update(progress_content)
+                    
+                    # Update stats panel
+                    layout["stats"].update(
+                        Panel(
+                            Align.center(make_stats_table(), vertical="middle"),
+                            title="[bold]Statistics[/bold]",
+                            border_style="yellow"
+                        )
+                    )
+                    
+                    # Update best scores panel
+                    layout["best_scores"].update(
+                        Panel(
+                            Align.center(create_best_scores_display(), vertical="middle"),
+                            title="[bold]🏆 High Scores 🏆[/bold]",
+                            border_style="green"
+                        )
+                    )
+                    
+                    await asyncio.sleep(0.1)
+                
+                # Wait for workers
+                await asyncio.gather(*workers)
+                
+                # Final stats update
+                layout["stats"].update(
+                    Panel(
+                        Align.center(make_stats_table(), vertical="middle"),
+                        title="[bold]Statistics - Complete[/bold]",
+                        border_style="green"
+                    )
+                )
+                
+                # Final best scores update
+                layout["best_scores"].update(
+                    Panel(
+                        Align.center(create_best_scores_display(), vertical="middle"),
+                        title="[bold]🏆 Final High Scores 🏆[/bold]",
+                        border_style="green"
+                    )
+                )
+                
+                await asyncio.sleep(1)
+        
+        # Convert results dict to list in original order
+        return [results.get(s.id) for s in samples if s.id in results]
+
     def process_batch(self, samples: List[Sample], compression_ratio: float = 0.6,
                      similarity: float = 0.75, batch_size: int = 5,
                      cooldown: float = 0.5, batch_cooldown: float = 2.0,
@@ -1565,6 +2476,9 @@ Examples:
     parser.add_argument('--poll-interval', type=float, default=5.0, help='Seconds between async status checks (default: 5.0)')
     parser.add_argument('--max-wait', type=float, default=1200.0, help='Maximum seconds to wait for async completion (default: 1200)')
     
+    # Parallel processing
+    parser.add_argument('--max-workers', type=int, default=4, help='Maximum concurrent workers (default: 4)')
+    
     # Options
     parser.add_argument('--no-cache', action='store_true', help='Disable cache lookup')
     parser.add_argument('--report', help='Save processing report to file')
@@ -1610,33 +2524,12 @@ Examples:
                 print(f"❌ Invalid JSON for filters: {args.filters}")
                 return 1
         
-        # Process samples
-        if args.async_mode:
-            # Use async processing
-            results = []
-            for sample in tqdm(samples, desc="Processing samples"):
-                result = processor.process_sample_async(
-                    sample,
-                    compression_ratio=args.compression,
-                    similarity=args.similarity,
-                    timeout=args.timeout,
-                    poll_interval=args.poll_interval,
-                    max_wait=args.max_wait,
-                    analysis_mode=args.analysis_mode,
-                    force_detail_count=args.force_detail_count,
-                    force_single_segment=not args.no_single_segment,
-                    include_embeddings=args.include_embeddings,
-                    filters=filters,
-                    use_cache=not args.no_cache
-                )
-                results.append(result)
-                
-                # Cooldown between samples
-                if samples.index(sample) < len(samples) - 1:
-                    time.sleep(args.cooldown)
-        else:
-            # Use synchronous processing
-            results = processor.process_batch(
+        # Process samples - ALWAYS use parallel processing
+        print("\n" * 2)  # Clear some space for the display
+        
+        # Run the async parallel processor
+        results = asyncio.run(
+            processor.process_batch_parallel(
                 samples,
                 compression_ratio=args.compression,
                 similarity=args.similarity,
@@ -1646,12 +2539,14 @@ Examples:
                 timeout=args.timeout,
                 max_retries=args.max_retries,
                 use_cache=not args.no_cache,
+                max_workers=args.max_workers,
                 analysis_mode=args.analysis_mode,
                 force_detail_count=args.force_detail_count,
                 force_single_segment=not args.no_single_segment,
                 include_embeddings=args.include_embeddings,
                 filters=filters
             )
+        )
         
         # Generate report
         print("\n" + "="*60)

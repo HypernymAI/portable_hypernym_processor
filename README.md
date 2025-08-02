@@ -6,12 +6,13 @@ Includes a processing queue system for managing batch jobs and coordinating mult
 
 ## Features
 
+- **True parallel processing** with beautiful Rich CLI interface
+- **Adaptive concurrency** that automatically adjusts to your API rate limits
 - Works with any SQLite database containing text samples
 - Direct SQL query support for flexible sample selection
 - Built-in caching to avoid reprocessing
-- Batch processing with rate limiting
-- Comprehensive error handling and retries
-- Progress tracking and reporting
+- Comprehensive error handling with exponential backoff
+- Real-time progress tracking with per-worker status
 - **Multi-segment support**: Properly handles long documents split into multiple semantic segments
 - **Semantic similarity tracking**: Shows how well each segment preserves meaning (0-100%)
 
@@ -155,8 +156,17 @@ Example: Processing a code repository from LongBench (sample `66fa208bbb02136c06
 ### Requirements
 
 ```bash
-pip install requests tqdm python-dotenv
+pip install -r requirements.txt
 ```
+
+This installs:
+- `requests` - HTTP client for API calls
+- `tqdm` - Progress bars (legacy, kept for compatibility)
+- `python-dotenv` - Environment variable management
+- `rich` - Beautiful terminal UI with parallel progress display
+- `aiohttp` - Async HTTP for concurrent API requests
+- `asyncio-throttle` - Rate limiting support
+- `aiosqlite` - Async SQLite operations
 
 ### Environment Variables
 
@@ -187,6 +197,43 @@ python portable_hypernym_processor/hypernym_processor.py ...
 ```
 
 The `.env` file MUST be in the same directory where you run the command. The script loads environment variables from `.env` in the current working directory only.
+
+## Parallel Processing Interface
+
+When you run the processor, you'll see a beautiful real-time display:
+
+```
+╭─ Hypernym Parallel Processor ─────────────────╮
+│          2025-08-02 04:48:20                  │
+╰───────────────────────────────────────────────╯
+
+╭─ Progress ────────────────────────────────────╮
+│ Overall Progress ████████░░ 1243/1519 • 4:32 │
+│                                               │
+│ Worker 1 ████████░░ 234/312 Sample #0234     │
+│ Worker 2 ████░░░░░░  89/298 Sample #0089     │
+│ Worker 3 ████████░░ 501/527 Sample #0501     │
+│ Worker 4 ██████░░░░ 156/347 Sample #0156     │
+└───────────────────────────────────────────────┘
+
+╭─ Statistics ──────────────────────────────────╮
+│  ✓ Processed     1,243                       │
+│  ⚡ Cache Hits    1,098                       │
+│  ✗ Errors           3                        │
+│  ⏱ Rate Limited    12                        │
+│  ⚡ Rate          45.2/sec                    │
+│  👷 Workers        4/16                       │
+└───────────────────────────────────────────────┘
+```
+
+### Adaptive Concurrency
+
+The processor automatically:
+1. **Queries your API rate limits** at startup
+2. **Starts conservatively** with 50% of recommended workers
+3. **Scales up** when performance is good
+4. **Scales down** immediately on rate limits or errors
+5. **Shows current/max workers** in the statistics panel
 
 ## Usage
 
@@ -250,6 +297,7 @@ python hypernym_processor.py \
 - `--timeout`: API timeout in seconds (default: 30)
 - `--max-retries`: Maximum retry attempts (default: 3)
 - `--max-samples`: Maximum samples to process
+- `--max-workers`: Maximum concurrent workers (default: 4, auto-adjusts based on API limits)
 
 #### Other Options:
 - `--no-cache`: Disable cache lookup
@@ -455,13 +503,21 @@ python queue_worker.py status
 
 ## Performance Considerations
 
-1. **Caching**: Results are cached by default. Use `--no-cache` to force reprocessing.
+1. **Parallel Processing**: The processor runs multiple workers concurrently by default, dramatically improving throughput. It automatically adjusts based on your API rate limits.
 
-2. **Rate Limiting**: Adjust `--cooldown` and `--batch-cooldown` based on API limits.
+2. **Adaptive Concurrency**: Workers are dynamically scaled up/down based on:
+   - API rate limit responses (429 errors immediately reduce workers)
+   - Error rates (>10% errors reduce workers)
+   - Response times (fast responses allow more workers)
+   - Your API tier limits (queries `/user/rate-limits` at startup)
 
-3. **Batch Size**: Larger batches process faster but may hit API limits.
+3. **Caching**: Results are cached by default. Use `--no-cache` to force reprocessing.
 
-4. **Timeouts**: Increase `--timeout` for longer texts.
+4. **Rate Limiting**: The system automatically handles rate limits with exponential backoff. Manual `--cooldown` and `--batch-cooldown` are now less important.
+
+5. **Optimal Workers**: Start with `--max-workers 8` or `16` - the system will find the optimal number automatically.
+
+6. **Timeouts**: Increase `--timeout` for longer texts (default 30s, use 60-120s for very long content).
 
 ## Error Handling
 
