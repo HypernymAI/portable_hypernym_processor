@@ -419,6 +419,25 @@ python queue_worker.py status data.sqlite
 - **Resume on failure** - Restart workers anytime
 - **Progress visibility** - See what's done and what's pending
 
+### Important: Metadata for Processing Control
+
+When using the queue system, **metadata must be written to the database WITH the sample** before the queue worker picks it up. The metadata controls how each sample is processed (sync/async, timeout, analysis mode, etc.).
+
+```sql
+-- Example: Insert sample with processing metadata
+INSERT INTO samples (id, content, processing_mode, timeout, analysis_mode, compression_ratio) 
+VALUES (
+    1, 
+    'Your text content here...', 
+    'async',         -- Process asynchronously
+    120,             -- 2 minute timeout
+    'comprehensive', -- Use comprehensive mode (Northstar only)
+    0.5              -- Target 50% compression
+);
+```
+
+Any columns beyond `id` and `content` automatically become metadata on the Sample object. If you add metadata after insertion, the queue worker may already be processing the sample with default settings.
+
 ### Example Workflow
 
 ```bash

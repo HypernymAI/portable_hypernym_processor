@@ -91,6 +91,7 @@ class HypernymProcessor:
     """
     
     def __init__(self, db_path: str = "portable_hypernym_processor.db", api_key: str = None, api_url: str = None):
+        self._tier_access = None  # Cache tier access level
         """
         Initialize the processor with database and API credentials.
         
@@ -368,7 +369,8 @@ class HypernymProcessor:
             result = processor.process_sample(
                 Sample(id=1, content="Long text here..."),
                 compression_ratio=0.5,  # Compress by 50%
-                similarity=0.8          # Keep 80% of meaning
+                similarity=0.8,         # Keep 80% of meaning
+                timeout=120             # 2 minutes for large content
             )
             
             if result['success']:
@@ -419,11 +421,19 @@ class HypernymProcessor:
                 # Add optional v2 parameters
                 if analysis_mode != "partial":
                     params['analysis_mode'] = analysis_mode
-                if force_detail_count is not None:
+                    
+                # Auto-adjust force_detail_count for large content if not specified
+                if force_detail_count is None and len(sample.content) > 10000:
+                    # For large content, auto-set higher detail count
+                    # Roughly 10 details per 10k chars, max 50
+                    auto_detail_count = min(10 * (len(sample.content) // 10000 + 1), 50)
+                    params['force_detail_count'] = auto_detail_count
+                    print(f"📊 Auto-setting force_detail_count={auto_detail_count} for large content ({len(sample.content):,} chars)")
+                elif force_detail_count is not None:
                     params['force_detail_count'] = force_detail_count
                 if force_single_segment:
                     params['force_single_segment'] = force_single_segment
-                if timeout != 30:  # Only add if non-default
+                if timeout != 60:  # Only add if non-default (V2 default is 60s)
                     params['timeout'] = timeout
                 if include_embeddings:
                     params['include_embeddings'] = include_embeddings
@@ -448,11 +458,23 @@ class HypernymProcessor:
                 response.raise_for_status()
                 result = response.json()
                 
+                # Debug: log response structure
+                if os.environ.get('DEBUG_HYPERNYM'):
+                    print(f"DEBUG: Response keys: {list(result.keys())[:5]}")
+                
                 processing_time = time.time() - start_time
                 
+                # Extract the V2 response from the legacy wrapper
+                # The actual V2 response is inside 'results'
+                if 'results' in result:
+                    v2_response = result['results']
+                else:
+                    v2_response = result
+                
                 # Extract compression ratio from segments
-                # Response structure: results.response.segments
-                segments = result.get('results', {}).get('response', {}).get('segments', [])
+                # V2 API Response structure: metadata, request, response
+                segments = v2_response.get('response', {}).get('segments', [])
+                
                 if segments:
                     # Segments have compression_ratio directly
                     segment_ratios = [s.get('compression_ratio', 0) for s in segments]
@@ -474,6 +496,23 @@ class HypernymProcessor:
                     'response': result
                 }
                 
+            except requests.exceptions.Timeout:
+                print(f"❌ Request timed out for sample {sample.id} after {timeout}s (attempt {attempt+1}/{max_retries})")
+                
+                if attempt < max_retries - 1:
+                    # Increase timeout for retry
+                    timeout = min(timeout * 1.5, 300)  # Increase by 50%, max 5 minutes
+                    sleep_time = (2 ** attempt) * (1 + random.random() * 0.2)
+                    print(f"⏱️ Retrying in {sleep_time:.1f}s with timeout={timeout}s...")
+                    time.sleep(sleep_time)
+                else:
+                    # Final attempt failed
+                    return {
+                        'success': False,
+                        'sample_id': sample.id,
+                        'error': f'Request timed out after {max_retries} attempts'
+                    }
+                    
             except Exception as e:
                 print(f"❌ Error processing sample {sample.id} (attempt {attempt+1}/{max_retries}): {e}")
                 
@@ -481,7 +520,15 @@ class HypernymProcessor:
                     sleep_time = (2 ** attempt) * (1 + random.random() * 0.2)
                     print(f"⏱️ Retrying in {sleep_time:.1f}s...")
                     time.sleep(sleep_time)
+                else:
+                    # Final attempt failed
+                    return {
+                        'success': False,
+                        'sample_id': sample.id,
+                        'error': f'Failed after {max_retries} attempts: {str(e)}'
+                    }
         
+        # This should never be reached due to early returns in exception handlers
         return {
             'success': False,
             'sample_id': sample.id,
@@ -534,12 +581,51 @@ class HypernymProcessor:
             # Process samples in batch
             batch_samples = tqdm(batch, desc="Samples", disable=not progress_bar)
             for sample_idx, sample in enumerate(batch_samples):
-                result = self.process_sample(
-                    sample, compression_ratio, similarity,
-                    timeout, max_retries, use_cache,
-                    analysis_mode, force_detail_count, force_single_segment,
-                    include_embeddings, filters
-                )
+                # Check metadata for per-sample processing parameters
+                sample_meta = sample.metadata or {}
+                
+                # Determine processing mode (sync/async)
+                processing_mode = sample_meta.get('processing_mode', 'sync')
+                
+                # Get parameters from metadata or use defaults
+                sample_compression = sample_meta.get('compression_ratio', compression_ratio)
+                sample_similarity = sample_meta.get('similarity', similarity)
+                sample_analysis_mode = sample_meta.get('analysis_mode', analysis_mode)
+                sample_filters = sample_meta.get('filters', filters)
+                sample_embeddings = sample_meta.get('include_embeddings', include_embeddings)
+                sample_single_segment = sample_meta.get('force_single_segment', force_single_segment)
+                
+                # Determine timeout based on content length if not in metadata
+                sample_timeout = sample_meta.get('timeout')
+                if sample_timeout is None:
+                    content_length = len(sample.content)
+                    if content_length > 10000:  # Large content
+                        sample_timeout = 60  # 60s for large content
+                        print(f"📊 Auto-setting timeout to {sample_timeout}s for large content ({content_length:,} chars)")
+                    else:
+                        sample_timeout = timeout  # Default 30s
+                
+                # Process based on mode
+                if processing_mode == 'async':
+                    print(f"🔄 Processing sample {sample.id} asynchronously")
+                    result = self.process_sample_async(
+                        sample, sample_compression, sample_similarity,
+                        sample_timeout, poll_interval=5.0, max_wait=1200.0,
+                        analysis_mode=sample_analysis_mode,
+                        force_detail_count=force_detail_count,
+                        force_single_segment=sample_single_segment,
+                        include_embeddings=sample_embeddings,
+                        filters=sample_filters,
+                        use_cache=use_cache
+                    )
+                else:
+                    # Synchronous processing
+                    result = self.process_sample(
+                        sample, sample_compression, sample_similarity,
+                        sample_timeout, max_retries, use_cache,
+                        sample_analysis_mode, force_detail_count, sample_single_segment,
+                        sample_embeddings, sample_filters
+                    )
                 results.append(result)
                 
                 # Cooldown between samples
@@ -552,6 +638,271 @@ class HypernymProcessor:
                 time.sleep(batch_cooldown)
         
         return results
+    
+    def analyze_async(self, sample: Sample, compression_ratio: float = 0.6,
+                      similarity: float = 0.75, timeout: int = 600,
+                      analysis_mode: str = "partial",
+                      force_detail_count: Optional[int] = None,
+                      force_single_segment: bool = True,
+                      include_embeddings: bool = False,
+                      filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Start asynchronous analysis and return task ID.
+        
+        Args:
+            sample: Sample object with content to process
+            compression_ratio: Target compression ratio
+            similarity: Target semantic similarity
+            timeout: Maximum processing time in seconds
+            analysis_mode: 'partial' or 'comprehensive'
+            force_detail_count: Exact number of details to extract
+            force_single_segment: Process as single segment
+            include_embeddings: Include embedding vectors
+            filters: Semantic filters for content exclusion
+            
+        Returns:
+            Dict with task_id and status:
+                {
+                    'success': bool,
+                    'task_id': str,
+                    'status': str,
+                    'error': str (if failed)
+                }
+        """
+        try:
+            # Prepare request
+            headers = {
+                'X-API-Key': self.api_key,
+                'Content-Type': 'application/json'
+            }
+            
+            # Build params
+            params = {
+                'min_compression_ratio': compression_ratio,
+                'min_semantic_similarity': similarity
+            }
+            
+            if analysis_mode != "partial":
+                params['analysis_mode'] = analysis_mode
+            if force_detail_count is not None:
+                params['force_detail_count'] = force_detail_count
+            if force_single_segment:
+                params['force_single_segment'] = force_single_segment
+            if timeout != 600:
+                params['timeout'] = timeout
+            if include_embeddings:
+                params['include_embeddings'] = include_embeddings
+            
+            payload = {
+                'essay_text': sample.content,
+                'params': params
+            }
+            
+            if filters:
+                payload['filters'] = filters
+            
+            # Make async request to analyze_begin endpoint
+            api_url_base = self.api_url.rsplit('/', 1)[0]  # Remove analyze_sync
+            async_url = f"{api_url_base}/analyze_begin"
+            
+            response = requests.post(
+                async_url,
+                headers=headers,
+                json=payload,
+                timeout=30  # Short timeout for async initiation
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            return {
+                'success': True,
+                'task_id': result.get('task_id'),
+                'status': result.get('status', 'pending')
+            }
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
+    def check_async_status(self, task_id: str) -> Dict[str, Any]:
+        """
+        Check status of asynchronous analysis task.
+        
+        Args:
+            task_id: Task ID returned by analyze_async
+            
+        Returns:
+            Dict with status and results:
+                {
+                    'success': bool,
+                    'status': str,  # 'pending', 'processing', 'completed', 'failed'
+                    'progress': float,  # 0.0-1.0
+                    'result': dict,  # Full result if completed
+                    'error': str  # Error message if failed
+                }
+        """
+        try:
+            headers = {
+                'X-API-Key': self.api_key,
+                'Accept': 'application/json'
+            }
+            
+            # Make request to analyze_status endpoint
+            api_url_base = self.api_url.rsplit('/', 1)[0]
+            status_url = f"{api_url_base}/analyze_status/{task_id}"
+            
+            response = requests.get(
+                status_url,
+                headers=headers,
+                timeout=30
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            return {
+                'success': True,
+                'status': result.get('status', 'unknown'),
+                'progress': result.get('progress', 0.0),
+                'result': result.get('result') if result.get('status') == 'completed' else None,
+                'error': result.get('error') if result.get('status') == 'failed' else None
+            }
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'status': 'error',
+                'error': str(e)
+            }
+    
+    def process_sample_async(self, sample: Sample, compression_ratio: float = 0.6,
+                            similarity: float = 0.75, timeout: int = 600,
+                            poll_interval: float = 5.0, max_wait: float = 1200.0,
+                            analysis_mode: str = "partial",
+                            force_detail_count: Optional[int] = None,
+                            force_single_segment: bool = True,
+                            include_embeddings: bool = False,
+                            filters: Optional[Dict[str, Any]] = None,
+                            use_cache: bool = True) -> Dict[str, Any]:
+        """
+        Process sample asynchronously with polling.
+        
+        Args:
+            sample: Sample to process
+            compression_ratio: Target compression ratio
+            similarity: Target semantic similarity
+            timeout: Processing timeout in seconds
+            poll_interval: Seconds between status checks
+            max_wait: Maximum seconds to wait for completion
+            analysis_mode: 'partial' or 'comprehensive'
+            force_detail_count: Exact number of details
+            force_single_segment: Process as single segment
+            include_embeddings: Include embeddings
+            filters: Semantic filters
+            use_cache: Check cache first
+            
+        Returns:
+            Processing result dict
+        """
+        # Check cache first
+        request_hash = self._get_request_hash(
+            sample.content, compression_ratio, similarity,
+            analysis_mode, force_detail_count, force_single_segment, filters
+        )
+        
+        if use_cache:
+            cached = self._check_cache(sample.id, request_hash)
+            if cached:
+                print(f"✅ Using cached result for sample {sample.id}")
+                return {
+                    'success': True,
+                    'sample_id': sample.id,
+                    'compression_ratio': cached['compression_ratio'],
+                    'processing_time': cached['processing_time'],
+                    'cached': True,
+                    'response': cached['response_data']
+                }
+        
+        # Start async analysis
+        start_time = time.time()
+        async_result = self.analyze_async(
+            sample, compression_ratio, similarity, timeout,
+            analysis_mode, force_detail_count, force_single_segment,
+            include_embeddings, filters
+        )
+        
+        if not async_result['success']:
+            return {
+                'success': False,
+                'sample_id': sample.id,
+                'error': async_result.get('error', 'Failed to start async analysis')
+            }
+        
+        task_id = async_result['task_id']
+        print(f"⏳ Started async analysis for sample {sample.id} (task: {task_id})")
+        
+        # Poll for completion
+        elapsed = 0
+        while elapsed < max_wait:
+            time.sleep(poll_interval)
+            elapsed = time.time() - start_time
+            
+            status_result = self.check_async_status(task_id)
+            
+            if not status_result['success']:
+                return {
+                    'success': False,
+                    'sample_id': sample.id,
+                    'error': status_result.get('error', 'Failed to check status')
+                }
+            
+            status = status_result['status']
+            progress = status_result.get('progress', 0)
+            
+            print(f"⏳ Sample {sample.id}: {status} ({progress:.0%} complete)")
+            
+            if status == 'completed':
+                result = status_result['result']
+                processing_time = time.time() - start_time
+                
+                # Extract compression ratio
+                if 'response' in result and 'segments' in result['response']:
+                    segments = result['response']['segments']
+                    segment_ratios = [s.get('compression_ratio', 0) for s in segments]
+                    actual_ratio = sum(segment_ratios) / len(segment_ratios) if segment_ratios else 0.0
+                else:
+                    actual_ratio = 0.0
+                
+                # Save to cache
+                self._save_response(sample.id, request_hash, result, actual_ratio, processing_time)
+                
+                print(f"✅ Completed async processing for sample {sample.id}")
+                
+                return {
+                    'success': True,
+                    'sample_id': sample.id,
+                    'compression_ratio': actual_ratio,
+                    'processing_time': processing_time,
+                    'cached': False,
+                    'response': result
+                }
+            
+            elif status == 'failed':
+                return {
+                    'success': False,
+                    'sample_id': sample.id,
+                    'error': status_result.get('error', 'Processing failed')
+                }
+        
+        # Timeout
+        return {
+            'success': False,
+            'sample_id': sample.id,
+            'error': f'Async processing timed out after {max_wait}s'
+        }
     
     def get_suggested_text(self, sample_id: int) -> Optional[str]:
         """
@@ -586,7 +937,8 @@ class HypernymProcessor:
                 response = json.loads(row[0])
                 # Navigate the response structure to get suggested text
                 try:
-                    suggested_text = response['results']['response']['texts']['suggested']
+                    # V2 API structure
+                    suggested_text = response['response']['texts']['suggested']
                     return suggested_text
                 except KeyError:
                     print(f"Warning: Could not find suggested text in response for sample {sample_id}")
@@ -626,7 +978,8 @@ class HypernymProcessor:
                 response = json.loads(row[0])
                 # Navigate the response structure to get compressed text
                 try:
-                    compressed_text = response['results']['response']['texts']['compressed']
+                    # V2 API structure
+                    compressed_text = response['response']['texts']['compressed']
                     return compressed_text
                 except KeyError:
                     print(f"Warning: Could not find compressed text in response for sample {sample_id}")
@@ -670,7 +1023,9 @@ class HypernymProcessor:
             if row:
                 response = json.loads(row[0])
                 try:
-                    segments = response['results']['response']['segments']
+                    # V2 API structure
+                    segments = response['response']['segments']
+                    
                     if not segments:
                         return None
                     
@@ -689,7 +1044,7 @@ class HypernymProcessor:
                         semantic_similarity = segment.get('semantic_similarity', 0)
                         
                         # Get the compressed hyperstring from the API response
-                        compressed = response['results']['response']['texts'].get('compressed', '')
+                        compressed = response['response']['texts'].get('compressed', '')
                         
                         # Build segment representation with index marker and similarity score
                         segment_repr = f"[SEGMENT {idx+1} | similarity: {semantic_similarity:.2f}] {compressed}"
@@ -744,7 +1099,9 @@ class HypernymProcessor:
             if row:
                 response = json.loads(row[0])
                 try:
-                    segments = response['results']['response']['segments']
+                    # V2 API structure
+                    segments = response['response']['segments']
+                    
                     if not segments:
                         return None
                     
@@ -933,7 +1290,9 @@ Failed Samples
             if row:
                 response = json.loads(row[0])
                 try:
-                    segments = response['results']['response']['segments']
+                    # V2 API structure
+                    segments = response['response']['segments']
+                    
                     embeddings = {}
                     
                     for idx, segment in enumerate(segments):
@@ -993,7 +1352,9 @@ Failed Samples
             if row:
                 response = json.loads(row[0])
                 try:
-                    segments = response['results']['response']['segments']
+                    # V2 API structure
+                    segments = response['response']['segments']
+                    
                     trial_stats = {}
                     
                     for idx, segment in enumerate(segments):
@@ -1035,6 +1396,31 @@ Failed Samples
         variance = sum((x - mean) ** 2 for x in values) / len(values)
         return variance ** 0.5
     
+    def check_tier_access(self) -> str:
+        """
+        Check API tier access level (Standard or Northstar).
+        
+        Returns:
+            'northstar' or 'standard'
+        """
+        if self._tier_access is not None:
+            return self._tier_access
+            
+        # TODO: Implement actual tier detection via API
+        # For now, try a Northstar-only feature and see if it works
+        # Future implementation:
+        # - Try comprehensive mode with minimal input
+        # - Check response for tier-specific error
+        # - Cache result
+        
+        # Default to Northstar as requested
+        self._tier_access = 'northstar'
+        return self._tier_access
+    
+    def has_northstar_access(self) -> bool:
+        """Check if user has Northstar tier access."""
+        return self.check_tier_access() == 'northstar'
+    
     def get_filtered_segments(self, sample_id: int) -> Optional[List[Dict[str, Any]]]:
         """
         Get segments that were excluded by filters.
@@ -1065,7 +1451,9 @@ Failed Samples
             if row:
                 response = json.loads(row[0])
                 try:
-                    segments = response['results']['response']['segments']
+                    # V2 API structure
+                    segments = response['response']['segments']
+                    
                     filtered = []
                     
                     for idx, segment in enumerate(segments):
@@ -1132,6 +1520,15 @@ Examples:
 
   # Process with custom parameters
   %(prog)s --db-path data.sqlite --all --compression 0.7 --similarity 0.8 --batch-size 10
+
+  # Use comprehensive mode with embeddings (Northstar only)
+  %(prog)s --db-path data.sqlite --all --analysis-mode comprehensive --include-embeddings
+
+  # Apply semantic filters to exclude content
+  %(prog)s --db-path data.sqlite --all --filters '{"purpose": {"exclude": [{"semantic_category": "political", "min_semantic_similarity": 0.35}]}}'
+
+  # Use async processing with polling
+  %(prog)s --db-path data.sqlite --all --async-mode --poll-interval 10 --max-wait 1800
         """
     )
     
@@ -1154,6 +1551,19 @@ Examples:
     parser.add_argument('--timeout', type=int, default=30, help='API timeout in seconds (default: 30)')
     parser.add_argument('--max-retries', type=int, default=3, help='Max retry attempts (default: 3)')
     parser.add_argument('--max-samples', type=int, help='Maximum samples to process')
+    
+    # V2 API parameters
+    parser.add_argument('--analysis-mode', choices=['partial', 'comprehensive'], default='partial',
+                       help='Analysis mode: partial (fast) or comprehensive (60 trials, Northstar only)')
+    parser.add_argument('--force-detail-count', type=int, help='Force specific number of details (3-9 standard, unlimited Northstar)')
+    parser.add_argument('--no-single-segment', action='store_true', help='Process paragraphs separately instead of as single segment')
+    parser.add_argument('--include-embeddings', action='store_true', help='Include 768D embedding vectors (Northstar only)')
+    parser.add_argument('--filters', type=str, help='JSON string with semantic filters to exclude content')
+    
+    # Async processing
+    parser.add_argument('--async-mode', dest='async_mode', action='store_true', help='Use async API endpoints with polling')
+    parser.add_argument('--poll-interval', type=float, default=5.0, help='Seconds between async status checks (default: 5.0)')
+    parser.add_argument('--max-wait', type=float, default=1200.0, help='Maximum seconds to wait for async completion (default: 1200)')
     
     # Options
     parser.add_argument('--no-cache', action='store_true', help='Disable cache lookup')
@@ -1191,18 +1601,57 @@ Examples:
             samples = samples[:args.max_samples]
             print(f"📊 Limited to {len(samples)} samples")
         
+        # Parse filters if provided
+        filters = None
+        if args.filters:
+            try:
+                filters = json.loads(args.filters)
+            except json.JSONDecodeError:
+                print(f"❌ Invalid JSON for filters: {args.filters}")
+                return 1
+        
         # Process samples
-        results = processor.process_batch(
-            samples,
-            compression_ratio=args.compression,
-            similarity=args.similarity,
-            batch_size=args.batch_size,
-            cooldown=args.cooldown,
-            batch_cooldown=args.batch_cooldown,
-            timeout=args.timeout,
-            max_retries=args.max_retries,
-            use_cache=not args.no_cache
-        )
+        if args.async_mode:
+            # Use async processing
+            results = []
+            for sample in tqdm(samples, desc="Processing samples"):
+                result = processor.process_sample_async(
+                    sample,
+                    compression_ratio=args.compression,
+                    similarity=args.similarity,
+                    timeout=args.timeout,
+                    poll_interval=args.poll_interval,
+                    max_wait=args.max_wait,
+                    analysis_mode=args.analysis_mode,
+                    force_detail_count=args.force_detail_count,
+                    force_single_segment=not args.no_single_segment,
+                    include_embeddings=args.include_embeddings,
+                    filters=filters,
+                    use_cache=not args.no_cache
+                )
+                results.append(result)
+                
+                # Cooldown between samples
+                if samples.index(sample) < len(samples) - 1:
+                    time.sleep(args.cooldown)
+        else:
+            # Use synchronous processing
+            results = processor.process_batch(
+                samples,
+                compression_ratio=args.compression,
+                similarity=args.similarity,
+                batch_size=args.batch_size,
+                cooldown=args.cooldown,
+                batch_cooldown=args.batch_cooldown,
+                timeout=args.timeout,
+                max_retries=args.max_retries,
+                use_cache=not args.no_cache,
+                analysis_mode=args.analysis_mode,
+                force_detail_count=args.force_detail_count,
+                force_single_segment=not args.no_single_segment,
+                include_embeddings=args.include_embeddings,
+                filters=filters
+            )
         
         # Generate report
         print("\n" + "="*60)
