@@ -263,7 +263,7 @@ class HypernymProcessor:
         self._init_results_table()
     
     def _init_results_table(self):
-        """Create samples and hypernym_responses tables if they don't exist"""
+        """Create samples, hypernym_responses, and error_entries tables if they don't exist"""
         with sqlite3.connect(self.db_path) as conn:
             # Create samples table - the standard input format
             conn.execute("""
@@ -287,12 +287,33 @@ class HypernymProcessor:
                 )
             """)
             conn.execute("""
+                CREATE TABLE IF NOT EXISTS error_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sample_id INTEGER NOT NULL,
+                    error_type TEXT NOT NULL,
+                    error_message TEXT NOT NULL,
+                    status_code INTEGER,
+                    request_params TEXT,
+                    attempt_number INTEGER,
+                    content_length INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_hypernym_sample_id 
                 ON hypernym_responses(sample_id)
             """)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_hypernym_request_hash 
                 ON hypernym_responses(request_hash)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_error_sample_id 
+                ON error_entries(sample_id)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_error_type 
+                ON error_entries(error_type)
             """)
             conn.commit()
     
@@ -455,6 +476,21 @@ class HypernymProcessor:
             """, (sample_id, request_hash, json.dumps(response_data), compression_ratio, processing_time))
             conn.commit()
     
+    def _save_error(self, sample_id: int, error_type: str, error_message: str, 
+                   status_code: Optional[int] = None, request_params: Optional[Dict] = None,
+                   attempt_number: int = 1, content_length: Optional[int] = None):
+        """Save error to error_entries table"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO error_entries
+                (sample_id, error_type, error_message, status_code, request_params, 
+                 attempt_number, content_length)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (sample_id, error_type, error_message, status_code, 
+                  json.dumps(request_params) if request_params else None,
+                  attempt_number, content_length))
+            conn.commit()
+    
     def process_sample(self, sample: Sample, compression_ratio: float = 0.6, 
                       similarity: float = 0.75, timeout: int = 30,
                       max_retries: int = 3, use_cache: bool = True,
@@ -605,17 +641,27 @@ class HypernymProcessor:
                 # V2 API Response structure: metadata, request, response
                 segments = v2_response.get('response', {}).get('segments', [])
                 
+                # Check for no_results flag (Zone 1/2 responses)
+                no_results = result.get('metadata', {}).get('no_results', False)
+                
                 if segments:
                     # Segments have compression_ratio directly
                     segment_ratios = [s.get('compression_ratio', 0) for s in segments]
                     actual_ratio = sum(segment_ratios) / len(segment_ratios) if segment_ratios else 0.0
+                elif no_results:
+                    # This is a valid Zone 1/2 response - short text that can't be compressed
+                    # Set ratio to 1.0 (no compression) to indicate it's processed but not compressed
+                    actual_ratio = 1.0
                 else:
                     actual_ratio = 0.0
                 
                 # Save to cache
                 self._save_response(sample.id, request_hash, result, actual_ratio, processing_time)
                 
-                print(f"✅ Processed sample {sample.id}: compression={actual_ratio:.2f}")
+                if no_results:
+                    print(f"✅ Processed sample {sample.id}: short text (Zone 1/2) - no compression possible")
+                else:
+                    print(f"✅ Processed sample {sample.id}: compression={actual_ratio:.2f}")
                 
                 return {
                     'success': True,
@@ -627,7 +673,8 @@ class HypernymProcessor:
                 }
                 
             except requests.exceptions.Timeout:
-                print(f"❌ Request timed out for sample {sample.id} after {timeout}s (attempt {attempt+1}/{max_retries})")
+                error_msg = f"Request timed out after {timeout}s"
+                print(f"❌ {error_msg} for sample {sample.id} (attempt {attempt+1}/{max_retries})")
                 
                 if attempt < max_retries - 1:
                     # Increase timeout for retry
@@ -636,7 +683,15 @@ class HypernymProcessor:
                     print(f"⏱️ Retrying in {sleep_time:.1f}s with timeout={timeout}s...")
                     time.sleep(sleep_time)
                 else:
-                    # Final attempt failed
+                    # Final attempt failed - save error
+                    self._save_error(
+                        sample.id, 
+                        'TIMEOUT',
+                        error_msg,
+                        request_params=params,
+                        attempt_number=attempt+1,
+                        content_length=len(sample.content)
+                    )
                     return {
                         'success': False,
                         'sample_id': sample.id,
@@ -644,14 +699,30 @@ class HypernymProcessor:
                     }
                     
             except Exception as e:
+                error_type = type(e).__name__
+                error_msg = str(e)
                 print(f"❌ Error processing sample {sample.id} (attempt {attempt+1}/{max_retries}): {e}")
+                
+                # Extract status code if it's an HTTP error
+                status_code = None
+                if hasattr(e, 'response') and hasattr(e.response, 'status_code'):
+                    status_code = e.response.status_code
                 
                 if attempt < max_retries - 1:
                     sleep_time = (2 ** attempt) * (1 + random.random() * 0.2)
                     print(f"⏱️ Retrying in {sleep_time:.1f}s...")
                     time.sleep(sleep_time)
                 else:
-                    # Final attempt failed
+                    # Final attempt failed - save error
+                    self._save_error(
+                        sample.id,
+                        error_type,
+                        error_msg,
+                        status_code=status_code,
+                        request_params=params if 'params' in locals() else None,
+                        attempt_number=attempt+1,
+                        content_length=len(sample.content)
+                    )
                     return {
                         'success': False,
                         'sample_id': sample.id,
@@ -674,7 +745,8 @@ class HypernymProcessor:
                                     force_detail_count: Optional[int] = None,
                                     force_single_segment: bool = True,
                                     include_embeddings: bool = False,
-                                    filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+                                    filters: Optional[Dict[str, Any]] = None,
+                                    max_display_workers: int = 20) -> List[Dict[str, Any]]:
         """Process samples in parallel with beautiful progress display"""
         console = Console()
         
@@ -1059,13 +1131,17 @@ class HypernymProcessor:
             
             return table
         
-        def make_layout(num_workers):
+        def make_layout(num_workers, max_display_workers=20):
             """Create the layout"""
             layout = Layout()
             
+            # Calculate optimal progress panel size based on max_display_workers
+            worker_panel_size = min(max(num_workers, 10), max_display_workers)
+            progress_panel_size = worker_panel_size + 3  # +3 for overall progress bar
+            
             layout.split_column(
                 Layout(name="header", size=3),
-                Layout(name="progress", size=num_workers + 3),
+                Layout(name="progress", size=progress_panel_size),
                 Layout(name="bottom")
             )
             
@@ -1089,9 +1165,23 @@ class HypernymProcessor:
             
             # Create progress panels layout
             progress_left = Layout()
+            
+            # When many workers, create scrollable panel
+            if num_workers > max_display_workers:
+                # Note: Rich doesn't support true scrolling in live displays,
+                # but we can show first N workers with indication of total
+                worker_panel_content = Panel(
+                    worker_progress, 
+                    border_style="cyan",
+                    title=f"[bold cyan]Workers (showing {max_display_workers} of {num_workers})[/bold cyan]",
+                    subtitle="[dim]Use --max-display-workers to show more[/dim]"
+                )
+            else:
+                worker_panel_content = Panel(worker_progress, border_style="cyan")
+            
             progress_left.split_column(
                 Layout(Panel(overall_progress, border_style="green"), size=3),
-                Layout(Panel(worker_progress, border_style="cyan"))
+                Layout(worker_panel_content)
             )
             
             # Split progress into left (bars) and right (banners)
@@ -1223,9 +1313,17 @@ class HypernymProcessor:
                     v2_response = result
                 
                 segments = v2_response.get('response', {}).get('segments', [])
+                
+                # Check for no_results flag (Zone 1/2 responses)
+                no_results = result.get('metadata', {}).get('no_results', False)
+                
                 if segments:
                     segment_ratios = [s.get('compression_ratio', 0) for s in segments]
                     actual_ratio = sum(segment_ratios) / len(segment_ratios) if segment_ratios else 0.0
+                elif no_results:
+                    # This is a valid Zone 1/2 response - short text that can't be compressed
+                    # Set ratio to 1.0 (no compression) to indicate it's processed but not compressed
+                    actual_ratio = 1.0
                 else:
                     actual_ratio = 0.0
                 
@@ -1273,6 +1371,38 @@ class HypernymProcessor:
             except Exception as e:
                 stats['errors'] += 1
                 concurrency_mgr.record_error()
+                error_type = type(e).__name__
+                error_msg = str(e)
+                
+                # Extract status code if available
+                status_code = None
+                if hasattr(e, 'status'):
+                    status_code = e.status
+                
+                # Enhanced error message for 408 timeouts
+                if status_code == 408:
+                    error_msg = f"Server timeout (408) at {self.api_url} - Server returned timeout status, not a client timeout. Content length: {len(sample.content)} bytes"
+                    console.print(f"[yellow]⚠️  408 Timeout from server for sample {sample.id} ({len(sample.content)} bytes)[/yellow]")
+                    console.print(f"[yellow]    URL: {self.api_url}[/yellow]")
+                    console.print(f"[yellow]    This is a server-side timeout, not a client timeout[/yellow]")
+                
+                # Save error to database
+                self._save_error(
+                    sample.id,
+                    error_type,
+                    error_msg,
+                    status_code=status_code,
+                    request_params={
+                        'min_compression_ratio': compression_ratio,
+                        'min_semantic_similarity': similarity,
+                        'analysis_mode': analysis_mode,
+                        'force_detail_count': force_detail_count,
+                        'force_single_segment': force_single_segment
+                    },
+                    attempt_number=1,  # Async version doesn't retry
+                    content_length=len(sample.content)
+                )
+                
                 worker_progress.update(
                     worker_task,
                     current_sample=f"Sample #{sample.id:04d} [red](failed: {str(e)})[/red]"
@@ -1344,7 +1474,7 @@ class HypernymProcessor:
         actual_workers = min(max_workers, len(samples))
         
         # Create layout
-        layout = make_layout(actual_workers)
+        layout = make_layout(actual_workers, max_display_workers)
         
         # Create aiohttp session
         async with aiohttp.ClientSession() as session:
@@ -2332,6 +2462,65 @@ Failed Samples
         """Check if user has Northstar tier access."""
         return self.check_tier_access() == 'northstar'
     
+    def get_error_summary(self) -> Dict[str, Any]:
+        """Get summary of all errors in the database"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Total errors
+            cursor.execute("SELECT COUNT(*) FROM error_entries")
+            total_errors = cursor.fetchone()[0]
+            
+            # Errors by type
+            cursor.execute("""
+                SELECT error_type, COUNT(*) as count 
+                FROM error_entries 
+                GROUP BY error_type 
+                ORDER BY count DESC
+            """)
+            errors_by_type = dict(cursor.fetchall())
+            
+            # Recent errors
+            cursor.execute("""
+                SELECT sample_id, error_type, error_message, content_length, 
+                       datetime(created_at, 'localtime') as error_time
+                FROM error_entries 
+                ORDER BY id DESC 
+                LIMIT 10
+            """)
+            recent_errors = [dict(zip([col[0] for col in cursor.description], row)) 
+                           for row in cursor.fetchall()]
+            
+            # Large content failures
+            cursor.execute("""
+                SELECT COUNT(*) 
+                FROM error_entries 
+                WHERE content_length > 10000
+            """)
+            large_content_failures = cursor.fetchone()[0]
+            
+            return {
+                'total_errors': total_errors,
+                'errors_by_type': errors_by_type,
+                'recent_errors': recent_errors,
+                'large_content_failures': large_content_failures
+            }
+    
+    def get_sample_errors(self, sample_id: int) -> List[Dict[str, Any]]:
+        """Get all errors for a specific sample"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT error_type, error_message, status_code, attempt_number,
+                       content_length, datetime(created_at, 'localtime') as error_time
+                FROM error_entries
+                WHERE sample_id = ?
+                ORDER BY id DESC
+            """, (sample_id,))
+            
+            return [dict(zip([col[0] for col in cursor.description], row)) 
+                   for row in cursor.fetchall()]
+    
     def get_filtered_segments(self, sample_id: int) -> Optional[List[Dict[str, Any]]]:
         """
         Get segments that were excluded by filters.
@@ -2450,6 +2639,7 @@ Examples:
     # Sample selection (mutually exclusive)
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument('--sample-ids', help='Comma-separated list of sample IDs')
+    selection.add_argument('--book-id', type=int, help='Process all samples from a specific book ID')
     selection.add_argument('--query', help='Custom SQL query (must return id and content columns)')
     selection.add_argument('--all', action='store_true', help='Process all samples in table')
     
@@ -2478,6 +2668,7 @@ Examples:
     
     # Parallel processing
     parser.add_argument('--max-workers', type=int, default=4, help='Maximum concurrent workers (default: 4)')
+    parser.add_argument('--max-display-workers', type=int, default=20, help='Maximum workers to display in UI (default: 20)')
     
     # Options
     parser.add_argument('--no-cache', action='store_true', help='Disable cache lookup')
@@ -2499,6 +2690,10 @@ Examples:
         if args.sample_ids:
             sample_ids = [int(sid.strip()) for sid in args.sample_ids.split(',')]
             samples = processor.get_samples_by_ids(sample_ids, args.table)
+        elif args.book_id:
+            # Build query to get all samples from the specified book
+            book_query = f"SELECT * FROM {args.table} WHERE book_id = {args.book_id} ORDER BY id"
+            samples = processor.get_samples_by_query(book_query)
         elif args.query:
             samples = processor.get_samples_by_query(args.query)
         else:  # --all
@@ -2544,7 +2739,8 @@ Examples:
                 force_detail_count=args.force_detail_count,
                 force_single_segment=not args.no_single_segment,
                 include_embeddings=args.include_embeddings,
-                filters=filters
+                filters=filters,
+                max_display_workers=args.max_display_workers
             )
         )
         
