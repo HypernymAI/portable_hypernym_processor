@@ -767,6 +767,7 @@ class HypernymProcessor:
             expand=False
         )
         
+        # Worker progress will show a scrollable window
         worker_progress = Progress(
             TextColumn("[bold cyan]{task.fields[worker_name]:>10}"),
             SpinnerColumn(),
@@ -776,6 +777,9 @@ class HypernymProcessor:
             console=console,
             expand=False
         )
+        
+        # Track all worker tasks (even if not visible)
+        all_worker_tasks = []
         
         # Get historical data from database for accurate averages
         async def get_historical_stats():
@@ -843,8 +847,42 @@ class HypernymProcessor:
             'all_similarities': historical_data['all_similarities'],  # ALL historical data
             'best_compression': historical_data['best_compression'],
             'best_similarity': historical_data['best_similarity'],
-            'animation_frame': 0
+            'animation_frame': 0,
+            'scroll_offset': 0,  # For scrolling through workers
+            'max_scroll': 0  # Will be set based on worker count
         }
+        
+        # Keyboard input handling
+        import sys, tty, termios, select
+        import threading
+        
+        def handle_keyboard():
+            """Handle keyboard input for scrolling"""
+            old_settings = termios.tcgetattr(sys.stdin)
+            try:
+                tty.setcbreak(sys.stdin.fileno())
+                while True:
+                    if select.select([sys.stdin], [], [], 0)[0]:
+                        key = sys.stdin.read(1)
+                        if key == '\x1b':  # ESC sequence
+                            next_chars = sys.stdin.read(2)
+                            if next_chars == '[A':  # Up arrow
+                                stats['scroll_offset'] = max(0, stats['scroll_offset'] - 1)
+                            elif next_chars == '[B':  # Down arrow  
+                                stats['scroll_offset'] = min(stats['max_scroll'], stats['scroll_offset'] + 1)
+                            elif next_chars == '[5':  # Page up
+                                if sys.stdin.read(1) == '~':
+                                    stats['scroll_offset'] = max(0, stats['scroll_offset'] - 18)
+                            elif next_chars == '[6':  # Page down
+                                if sys.stdin.read(1) == '~':
+                                    stats['scroll_offset'] = min(stats['max_scroll'], stats['scroll_offset'] + 18)
+                    time.sleep(0.05)
+            finally:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+        
+        # Start keyboard thread
+        keyboard_thread = threading.Thread(target=handle_keyboard, daemon=True)
+        keyboard_thread.start()
         
         # Results storage
         results = {}
@@ -1166,15 +1204,24 @@ class HypernymProcessor:
             # Create progress panels layout
             progress_left = Layout()
             
-            # When many workers, create scrollable panel
+            # Calculate visible range based on scroll offset
+            visible_start = stats.get('scroll_offset', 0)
+            visible_end = min(visible_start + max_display_workers, num_workers)
+            
+            # Create scrolling indicator
             if num_workers > max_display_workers:
-                # Note: Rich doesn't support true scrolling in live displays,
-                # but we can show first N workers with indication of total
+                # Calculate position for iOS-style scrollbar
+                scroll_percent = visible_start / max(1, num_workers - max_display_workers)
+                position_text = f"[{visible_start+1}-{visible_end}/{num_workers}]"
+                
+                # Add scroll indicators
+                scroll_info = "↑/↓: scroll 1 | PgUp/PgDn: scroll 18"
+                
                 worker_panel_content = Panel(
                     worker_progress, 
                     border_style="cyan",
-                    title=f"[bold cyan]Workers (showing {max_display_workers} of {num_workers})[/bold cyan]",
-                    subtitle="[dim]Use --max-display-workers to show more[/dim]"
+                    title=f"[bold cyan]Workers {position_text}[/bold cyan]",
+                    subtitle=f"[dim]{scroll_info}[/dim]"
                 )
             else:
                 worker_panel_content = Panel(worker_progress, border_style="cyan")
@@ -1219,10 +1266,21 @@ class HypernymProcessor:
         
         async def process_sample_async(self, session, sample, worker_id, worker_task):
             """Process a single sample asynchronously"""
-            worker_progress.update(
-                worker_task,
-                current_sample=f"Sample #{sample.id:04d}"
-            )
+            # Find worker info
+            worker_info = None
+            for info in all_worker_tasks:
+                if info['id'] == worker_id:
+                    worker_info = info
+                    break
+            
+            # Update display if visible
+            if worker_info:
+                worker_info['current_sample'] = f"Sample #{sample.id:04d}"
+                if worker_info['visible'] and worker_info['task_id'] is not None:
+                    worker_progress.update(
+                        worker_info['task_id'],
+                        current_sample=worker_info['current_sample']
+                    )
             
             # Generate request hash for caching
             request_hash = self._get_request_hash(
@@ -1236,10 +1294,13 @@ class HypernymProcessor:
                 if cached:
                     stats['processed'] += 1
                     stats['cache_hits'] += 1
-                    worker_progress.update(
-                        worker_task,
-                        current_sample=f"Sample #{sample.id:04d} [yellow](cached)[/yellow]"
-                    )
+                    if worker_info:
+                        worker_info['current_sample'] = f"Sample #{sample.id:04d} [yellow](cached)[/yellow]"
+                        if worker_info['visible'] and worker_info['task_id'] is not None:
+                            worker_progress.update(
+                                worker_info['task_id'],
+                                current_sample=worker_info['current_sample']
+                            )
                     return {
                         'success': True,
                         'sample_id': sample.id,
@@ -1291,10 +1352,13 @@ class HypernymProcessor:
                     if response.status == 429:
                         stats['rate_limited'] += 1
                         concurrency_mgr.record_rate_limit()
-                        worker_progress.update(
-                            worker_task,
-                            current_sample=f"Sample #{sample.id:04d} [magenta](rate limited)[/magenta]"
-                        )
+                        if worker_info:
+                            worker_info['current_sample'] = f"Sample #{sample.id:04d} [magenta](rate limited)[/magenta]"
+                            if worker_info['visible'] and worker_info['task_id'] is not None:
+                                worker_progress.update(
+                                    worker_info['task_id'],
+                                    current_sample=worker_info['current_sample']
+                                )
                         # Exponential backoff with jitter
                         backoff = min(60, 2 ** stats.get('rate_limit_retries', 0) + random.random())
                         await asyncio.sleep(backoff)
@@ -1403,26 +1467,61 @@ class HypernymProcessor:
                     content_length=len(sample.content)
                 )
                 
-                worker_progress.update(
-                    worker_task,
-                    current_sample=f"Sample #{sample.id:04d} [red](failed: {str(e)})[/red]"
-                )
+                if worker_info:
+                    worker_info['current_sample'] = f"Sample #{sample.id:04d} [red](failed: {str(e)})[/red]"
+                    if worker_info['visible'] and worker_info['task_id'] is not None:
+                        worker_progress.update(
+                            worker_info['task_id'],
+                            current_sample=worker_info['current_sample']
+                        )
                 return {
                     'success': False,
                     'sample_id': sample.id,
                     'error': str(e)
                 }
         
+        async def update_worker_visibility():
+            """Update which workers are visible based on scroll offset"""
+            visible_start = stats['scroll_offset']
+            visible_end = visible_start + max_display_workers
+            
+            # Clear all current tasks
+            for task_id in worker_progress.task_ids:
+                worker_progress.remove_task(task_id)
+            
+            # Add visible workers
+            for i, worker_info in enumerate(all_worker_tasks):
+                if visible_start <= i < visible_end:
+                    task = worker_progress.add_task(
+                        f"Worker {worker_info['id']}",
+                        total=worker_info['total'],
+                        completed=worker_info['completed'],
+                        worker_name=f"Worker {worker_info['id']}",
+                        current_sample=worker_info['current_sample']
+                    )
+                    worker_info['task_id'] = task
+                    worker_info['visible'] = True
+                else:
+                    worker_info['visible'] = False
+                    worker_info['task_id'] = None
+        
         async def worker(self, session, worker_id, queue, overall_task, samples_per_worker):
             """Worker coroutine"""
             worker_samples_processed = 0
-            worker_task = worker_progress.add_task(
-                f"Worker {worker_id}",
-                total=samples_per_worker,  # Each worker gets approximately this many
-                worker_name=f"Worker {worker_id}",
-                current_sample="Starting...",
-                samples_count=0
-            )
+            
+            # Store task info for scrolling
+            worker_info = {
+                'id': worker_id,
+                'visible': False,
+                'task_id': None,
+                'total': samples_per_worker,
+                'completed': 0,
+                'current_sample': "Starting..."
+            }
+            all_worker_tasks.append(worker_info)
+            
+            # Initial visibility check
+            await update_worker_visibility()
             
             while True:
                 try:
@@ -1431,17 +1530,22 @@ class HypernymProcessor:
                         break
                     
                     # Process the sample
-                    result = await process_sample_async(self, session, sample, worker_id, worker_task)
+                    result = await process_sample_async(self, session, sample, worker_id, worker_info['task_id'])
                     results[sample.id] = result
                     
                     # Update worker stats
                     worker_samples_processed += 1
-                    worker_progress.update(
-                        worker_task,
-                        completed=worker_samples_processed,
-                        current_sample=f"Sample #{sample.id:04d} [green](done)[/green]",
-                        samples_count=worker_samples_processed
-                    )
+                    worker_info['completed'] = worker_samples_processed
+                    worker_info['current_sample'] = f"Sample #{sample.id:04d} [green](done)[/green]"
+                    
+                    # Update progress bar if visible
+                    if worker_info['visible'] and worker_info['task_id'] is not None:
+                        worker_progress.update(
+                            worker_info['task_id'],
+                            completed=worker_samples_processed,
+                            current_sample=worker_info['current_sample'],
+                            samples_count=worker_samples_processed
+                        )
                     
                     # Update overall progress
                     overall_progress.advance(overall_task)
@@ -1449,15 +1553,19 @@ class HypernymProcessor:
                     queue.task_done()
                     
                 except Exception as e:
-                    worker_progress.update(
-                        worker_task,
-                        current_sample=f"[red]Error: {str(e)}[/red]"
-                    )
+                    worker_info['current_sample'] = f"[red]Error: {str(e)}[/red]"
+                    if worker_info['visible'] and worker_info['task_id'] is not None:
+                        worker_progress.update(
+                            worker_info['task_id'],
+                            current_sample=worker_info['current_sample']
+                        )
             
-            worker_progress.update(
-                worker_task,
-                current_sample="[green]Complete[/green]"
-            )
+            worker_info['current_sample'] = "[green]Complete[/green]"
+            if worker_info['visible'] and worker_info['task_id'] is not None:
+                worker_progress.update(
+                    worker_info['task_id'],
+                    current_sample=worker_info['current_sample']
+                )
         
         # Create overall task
         overall_task = overall_progress.add_task(
@@ -1472,6 +1580,9 @@ class HypernymProcessor:
         
         # Adjust worker count if we have fewer samples than workers
         actual_workers = min(max_workers, len(samples))
+        
+        # Set max scroll based on workers that won't fit
+        stats['max_scroll'] = max(0, actual_workers - max_display_workers)
         
         # Create layout
         layout = make_layout(actual_workers, max_display_workers)
@@ -1506,14 +1617,38 @@ class HypernymProcessor:
                     await queue.put(None)
                 
                 # Update stats while processing
+                last_scroll = stats['scroll_offset']
                 while any(not w.done() for w in workers):
                     stats['animation_frame'] += 1
                     
+                    # Check if scroll position changed
+                    if stats['scroll_offset'] != last_scroll:
+                        await update_worker_visibility()
+                        last_scroll = stats['scroll_offset']
+                    
+                    # Calculate visible range for dynamic panel title
+                    visible_start = stats['scroll_offset']
+                    visible_end = min(visible_start + max_display_workers, actual_workers)
+                    
                     # Update progress section with banners
                     progress_left = Layout()
+                    
+                    # Create worker panel with scroll info
+                    if actual_workers > max_display_workers:
+                        position_text = f"[{visible_start+1}-{visible_end}/{actual_workers}]"
+                        scroll_info = "↑/↓: scroll 1 | PgUp/PgDn: scroll 18"
+                        worker_panel = Panel(
+                            worker_progress,
+                            border_style="cyan",
+                            title=f"[bold cyan]Workers {position_text}[/bold cyan]",
+                            subtitle=f"[dim]{scroll_info}[/dim]"
+                        )
+                    else:
+                        worker_panel = Panel(worker_progress, border_style="cyan")
+                    
                     progress_left.split_column(
                         Layout(Panel(overall_progress, border_style="green"), size=3),
-                        Layout(Panel(worker_progress, border_style="cyan"))
+                        Layout(worker_panel)
                     )
                     
                     progress_content = Layout()

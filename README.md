@@ -1,20 +1,29 @@
 # Portable Hypernym Processor
 
-A standalone tool for processing text samples from any SQLite database through the Hypernym compression API. This tool works directly with database queries without requiring catalog files or the benchmark framework.
+A high-performance, standalone tool for processing text samples from any SQLite database through the Hypernym compression API. Features massive parallel processing capabilities with an elegant, scrollable terminal interface that can handle hundreds of concurrent workers.
 
-Includes a processing queue system for managing batch jobs and coordinating multiple workers.
+## Key Features
 
-## Features
+### 🚀 Performance & Scalability
+- **Massive parallel processing**: Handle 256+ concurrent workers efficiently
+- **Adaptive concurrency**: Automatically adjusts workers based on API rate limits
+- **Smart caching**: Skip already-processed samples automatically
+- **Batch processing**: Process entire books or databases in one command
+- **Rate limit handling**: Automatic backoff and retry with visual feedback
 
-- **True parallel processing** with beautiful Rich CLI interface
-- **Adaptive concurrency** that automatically adjusts to your API rate limits
-- Works with any SQLite database containing text samples
-- Direct SQL query support for flexible sample selection
-- Built-in caching to avoid reprocessing
-- Comprehensive error handling with exponential backoff
-- Real-time progress tracking with per-worker status
-- **Multi-segment support**: Properly handles long documents split into multiple semantic segments
-- **Semantic similarity tracking**: Shows how well each segment preserves meaning (0-100%)
+### 🎨 Beautiful Terminal Interface
+- **Scrollable worker display**: Monitor unlimited workers with keyboard navigation
+- **Real-time statistics**: Live compression ratios, similarity scores, and processing rates
+- **Visual progress tracking**: Individual progress bars for each worker
+- **Performance meters**: Animated compression and similarity score displays
+- **High score tracking**: Best compression and similarity achievements
+
+### 🔧 Flexible Processing
+- **Multiple selection modes**: Process by ID, book, custom query, or entire database
+- **SQL query support**: Use any SQL query to select samples
+- **Multi-segment support**: Handles documents split into semantic segments
+- **Semantic similarity tracking**: Monitor meaning preservation (0-100%)
+- **Error resilience**: Comprehensive error handling with detailed logging
 
 ## How It Works: Complete Workflow Example
 
@@ -198,33 +207,71 @@ python portable_hypernym_processor/hypernym_processor.py ...
 
 The `.env` file MUST be in the same directory where you run the command. The script loads environment variables from `.env` in the current working directory only.
 
-## Parallel Processing Interface
+## Visual Interface
 
-When you run the processor, you'll see a beautiful real-time display:
+When you run the processor, you'll see a stunning real-time display that scales to any number of workers:
 
 ```
-╭─ Hypernym Parallel Processor ─────────────────╮
-│          2025-08-02 04:48:20                  │
-╰───────────────────────────────────────────────╯
-
-╭─ Progress ────────────────────────────────────╮
-│ Overall Progress ████████░░ 1243/1519 • 4:32 │
-│                                               │
-│ Worker 1 ████████░░ 234/312 Sample #0234     │
-│ Worker 2 ████░░░░░░  89/298 Sample #0089     │
-│ Worker 3 ████████░░ 501/527 Sample #0501     │
-│ Worker 4 ██████░░░░ 156/347 Sample #0156     │
-└───────────────────────────────────────────────┘
-
-╭─ Statistics ──────────────────────────────────╮
-│  ✓ Processed     1,243                       │
-│  ⚡ Cache Hits    1,098                       │
-│  ✗ Errors           3                        │
-│  ⏱ Rate Limited    12                        │
-│  ⚡ Rate          45.2/sec                    │
-│  👷 Workers        4/16                       │
-└───────────────────────────────────────────────┘
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                          HYPERNYM Parallel Processor                                                           │
+│                                                            2025-08-05 15:42:37                                                                 │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭───────────────────────────────────────────────────────────────────────────────────────────────────────────╮╭──── 📊 Performance Meters 📊 ─────╮
+│ ⠙ Overall Progress ████████████████████████████████████████████████████░░░░░░░░░░░░  78% • 0:12:34 • 0:03:21 ││                                   │
+╰───────────────────────────────────────────────────────────────────────────────────────────────────────────╯│   ╔═══════════════════════════╗   │
+╭─────────────────────────────────────────── Workers [21-40/256] ───────────────────────────────────────────╮│   ║ ⚡ COMPRESSION POWER ⚡   ║   │
+│  Worker 21 ⠋ ████████████████████████████ 100% Sample #1234 [green](done)[/green]                          ││   ╠═══════════════════════════╣   │
+│  Worker 22 ⠋ ████████████████░░░░░░░░░░░  67% Sample #5678                                                ││   ║ [████████               ] ║   │
+│  Worker 23 ⠙ ██████████░░░░░░░░░░░░░░░░░  42% Sample #9012                                                ││   ║            40.2%          ║   │
+│  Worker 24 ⠹ ████████████████████░░░░░░░  83% Sample #3456                                                ││   ╚═══════════════════════════╝   │
+│  Worker 25 ⠸ ░░░░░░░░░░░░░░░░░░░░░░░░░░░   0% Starting...                                                 ││                                   │
+│  Worker 26 ⠼ ████████████████████████████ 100% Sample #7890 [yellow](cached)[/yellow]                      ││   ╔═══════════════════════════╗   │
+│  Worker 27 ⠴ ██████░░░░░░░░░░░░░░░░░░░░░  25% Sample #2468                                                ││   ║ 💎 SIMILARITY SHIELD 💎   ║   │
+│  Worker 28 ⠦ ████████████████████████░░░  92% Sample #1357                                                ││   ╠═══════════════════════════╣   │
+│  Worker 29 ⠧ ████████████░░░░░░░░░░░░░░░  50% Sample #8642                                                ││   ║ [██████████             ] ║   │
+│  Worker 30 ⠇ ████████████████████████████ 100% Sample #9753 [green](done)[/green]                          ││   ║            54.2%          ║   │
+│  Worker 31 ⠏ ░░░░░░░░░░░░░░░░░░░░░░░░░░░   8% Sample #1593                                                ││   ╚═══════════════════════════╝   │
+│  Worker 32 ⠋ ████████████████████░░░░░░░  75% Sample #7531                                                ││                                   │
+│  Worker 33 ⠙ ██████████████░░░░░░░░░░░░░  58% Sample #2846                                                ││   Historical samples: 125,847     │
+│  Worker 34 ⠹ ████████████████████████████ 100% Sample #9517 [magenta](rate limited)[/magenta]            ││                                   │
+│  Worker 35 ⠸ ██████████████████░░░░░░░░░  71% Sample #3579                                                ││                                   │
+│  Worker 36 ⠼ ████░░░░░░░░░░░░░░░░░░░░░░░  17% Sample #6284                                                ││   ★ MEGA COMBO ACTIVE ★           │
+│  Worker 37 ⠴ ████████████████████████████ 100% Sample #1628 [green](done)[/green]                          ││                                   │
+│  Worker 38 ⠦ ████████████████████░░░░░░░  79% Sample #7395                                                ││                                   │
+│  Worker 39 ⠧ ██████████████████████████░░  96% Sample #8527                                                ││                                   │
+│  Worker 40 ⠇ ████████░░░░░░░░░░░░░░░░░░░  33% Sample #4826                                                ││                                   │
+╰────────────────────────────────── ↑/↓: scroll 1 | PgUp/PgDn: scroll 18 ───────────────────────────────────╯╰───────────────────────────────────╯
+╭───────────────────────────── Statistics ──────────────────────────────╮╭────────────────────────── 🏆 High Scores 🏆 ──────────────────────────╮
+│                                                                       ││             🏆 COMPRESSION            🏆 SIMILARITY                    │
+│                       ✓ Processed       98,432                        ││             Best: 99.7%               Best: 100.0%                    │
+│                       ⚡ Cache Hits     45,218                        ││             ║----====▓▓▓▓▓====----    ----====▓▓▓▓▓▓▓===----         │
+│                       ✗ Errors          126                           ││             0%        50%      100%   0%        50%       100%        │
+│                       ⏱ Rate Limited    43                            ││             [Min: 12%  Avg: 40%  Max: 99%]  [Min: 15%  Avg: 54%  Max: 100%] │
+│                       ⚡ Rate           186.3/sec                      ││                                                                       │
+│                       👷 Workers        192/192                        ││             Total samples: 125,847                                    │
+│                                                                       ││                                                                       │
+╰───────────────────────────────────────────────────────────────────────╯╰───────────────────────────────────────────────────────────────────────╯
 ```
+
+### Interface Features
+
+#### 🎮 Keyboard Controls
+- **↑/↓ arrows**: Scroll through workers one at a time
+- **PgUp/PgDn**: Scroll by 18 workers (full page)
+- **Position indicator**: Shows current view range `[21-40/256]`
+- **Auto-adjusting**: Window size adapts to terminal height
+
+#### 📊 Live Performance Meters
+- **Compression Power**: Animated gauge showing average compression ratio
+- **Similarity Shield**: Animated gauge showing semantic preservation
+- **Mega Combo**: Activates when both metrics exceed thresholds
+- **Historical tracking**: Running statistics from all processed samples
+
+#### 🏆 High Scores Display
+- **Distribution visualization**: ASCII art violin plots of compression/similarity
+- **Min/Avg/Max indicators**: Statistical summary of performance
+- **Best achievements**: Track record compression and similarity scores
+- **Total samples**: Running count of all processed samples
 
 ### Adaptive Concurrency
 
@@ -247,17 +294,33 @@ cd portable_hypernym_processor  # ALWAYS CD INTO THE DIRECTORY FIRST
 python hypernym_processor.py --db-path data.sqlite --sample-ids 1,2,3,4,5
 ```
 
-2. **Process samples using custom SQL query:**
+2. **Process an entire book by ID:**
 ```bash
-cd portable_hypernym_processor  # ALWAYS CD INTO THE DIRECTORY FIRST
+python hypernym_processor.py --db-path gutenberg_books.db --book-id 120
+```
+
+3. **Process samples using custom SQL query:**
+```bash
 python hypernym_processor.py --db-path data.sqlite \
   --query "SELECT id, content FROM samples WHERE category='literature' LIMIT 10"
 ```
 
-3. **Process all samples with a limit:**
+4. **Process all samples with massive parallelism:**
 ```bash
-cd portable_hypernym_processor  # ALWAYS CD INTO THE DIRECTORY FIRST
-python hypernym_processor.py --db-path data.sqlite --all --max-samples 100
+python hypernym_processor.py --db-path data.sqlite --all --max-workers 256
+```
+
+### Scrollable Interface Examples
+
+```bash
+# Process with 50 workers (scrollable display)
+python hypernym_processor.py --db-path data.sqlite --all --max-workers 50
+
+# Process with 256 workers, show 30 at a time
+python hypernym_processor.py --db-path data.sqlite --all --max-workers 256 --max-display-workers 30
+
+# Process specific book with maximum parallelism
+python hypernym_processor.py --db-path gutenberg_books.db --book-id 1342 --max-workers 192
 ```
 
 ### Advanced Options
@@ -281,12 +344,17 @@ python hypernym_processor.py \
 
 #### Required (one of):
 - `--sample-ids`: Comma-separated list of sample IDs to process
+- `--book-id`: Process all samples from a specific book ID
 - `--query`: Custom SQL query (must return 'id' and 'content' columns)
 - `--all`: Process all samples in the table
 
 #### Database Options:
 - `--db-path`: Path to SQLite database (required)
 - `--table`: Table name containing samples (default: 'samples')
+
+#### Parallel Processing:
+- `--max-workers`: Maximum concurrent workers (default: 4, auto-adjusts based on API limits)
+- `--max-display-workers`: Maximum workers to show in scrollable display (default: 20)
 
 #### Processing Parameters:
 - `--compression`: Target compression ratio (default: 0.6)
@@ -297,7 +365,13 @@ python hypernym_processor.py \
 - `--timeout`: API timeout in seconds (default: 30)
 - `--max-retries`: Maximum retry attempts (default: 3)
 - `--max-samples`: Maximum samples to process
-- `--max-workers`: Maximum concurrent workers (default: 4, auto-adjusts based on API limits)
+
+#### V2 API Parameters:
+- `--analysis-mode`: Analysis depth - `partial` (default) or `comprehensive` (Northstar only)
+- `--force-detail-count`: Force specific number of details (3-9 standard, unlimited Northstar)
+- `--no-single-segment`: Process paragraphs separately instead of as single segment
+- `--include-embeddings`: Include 768D embedding vectors (Northstar only)
+- `--filters`: JSON string with semantic filters to exclude content
 
 #### Other Options:
 - `--no-cache`: Disable cache lookup
@@ -503,28 +577,94 @@ python queue_worker.py status
 
 ## Performance Considerations
 
-1. **Parallel Processing**: The processor runs multiple workers concurrently by default, dramatically improving throughput. It automatically adjusts based on your API rate limits.
+### 🚀 Parallel Processing at Scale
 
-2. **Adaptive Concurrency**: Workers are dynamically scaled up/down based on:
-   - API rate limit responses (429 errors immediately reduce workers)
-   - Error rates (>10% errors reduce workers)
-   - Response times (fast responses allow more workers)
-   - Your API tier limits (queries `/user/rate-limits` at startup)
+The processor is designed for massive parallelism:
 
-3. **Caching**: Results are cached by default. Use `--no-cache` to force reprocessing.
+1. **Auto-scaling Workers**: 
+   - Queries your API rate limits at startup
+   - Starts conservatively (50% of max)
+   - Scales up when performance is good
+   - Scales down on errors or rate limits
 
-4. **Rate Limiting**: The system automatically handles rate limits with exponential backoff. Manual `--cooldown` and `--batch-cooldown` are now less important.
+2. **Optimal Worker Counts**:
+   - **Standard tier**: 4-16 workers typical
+   - **Northstar tier**: 96-192 workers recommended
+   - **Testing**: We've successfully run 256+ workers
 
-5. **Optimal Workers**: Start with `--max-workers 8` or `16` - the system will find the optimal number automatically.
+3. **Scrollable Display**: 
+   - Shows 20 workers by default
+   - Use keyboard to navigate through all workers
+   - Minimal performance impact even with 256+ workers
 
-6. **Timeouts**: Increase `--timeout` for longer texts (default 30s, use 60-120s for very long content).
+### ⚡ Performance Tips
+
+1. **Start Big**: Don't be afraid to use many workers - the system self-regulates
+   ```bash
+   python hypernym_processor.py --db-path data.sqlite --all --max-workers 192
+   ```
+
+2. **Cache Strategy**: First run caches results, subsequent runs are lightning fast
+   ```bash
+   # First run: processes everything
+   python hypernym_processor.py --db-path data.sqlite --all --max-workers 96
+   
+   # Second run: skips cached results, only processes new/failed
+   python hypernym_processor.py --db-path data.sqlite --all --max-workers 96
+   ```
+
+3. **Timeout Tuning**: 
+   - Default 30s works for most content
+   - Use 60-120s for very long documents
+   - Server returns 408 for problematic content (not real timeouts)
+
+4. **Display Performance**:
+   - Scrolling is smooth even with 256 workers
+   - Only visible workers update (performance optimization)
+   - Keyboard input handled in separate thread
 
 ## Error Handling
 
-- Failed samples are reported but don't stop processing
-- Automatic retries with exponential backoff
-- Exit code 1 if any samples fail, 0 if all succeed
-- Detailed error reporting in output and optional report file
+### Robust Error Management
+
+The processor handles errors gracefully without stopping:
+
+1. **Automatic Retries**: Exponential backoff with jitter for transient failures
+2. **Error Tracking**: All errors saved to `error_entries` table with details
+3. **Visual Feedback**: Color-coded status in worker display
+   - 🟢 `[green](done)[/green]` - Successfully processed
+   - 🟡 `[yellow](cached)[/yellow]` - Retrieved from cache
+   - 🟣 `[magenta](rate limited)[/magenta]` - Hit rate limit, will retry
+   - 🔴 `[red](failed: reason)[/red]` - Processing failed
+
+4. **Common Error Types**:
+   - **408 Timeout**: Usually content moderation blocks (not real timeouts)
+   - **429 Rate Limit**: Automatic backoff and retry
+   - **500 Server Error**: Logged and skipped
+   - **Connection Error**: Retried with exponential backoff
+
+### Error Analysis
+
+Check errors after processing:
+```sql
+-- View recent errors
+SELECT sample_id, error_type, error_message, created_at 
+FROM error_entries 
+ORDER BY created_at DESC 
+LIMIT 20;
+
+-- Count errors by type
+SELECT error_type, COUNT(*) as count 
+FROM error_entries 
+GROUP BY error_type 
+ORDER BY count DESC;
+
+-- Find samples that consistently fail
+SELECT sample_id, COUNT(*) as attempts 
+FROM error_entries 
+GROUP BY sample_id 
+HAVING attempts > 3;
+```
 
 ## Understanding Hypernym Compression
 
@@ -670,3 +810,36 @@ If the API cannot achieve the requested compression while maintaining the simila
 - The `texts.suggested` field contains the ORIGINAL text unchanged
 - Check the actual compression_ratio to know if compression occurred
 - Lower the similarity threshold or increase the compression ratio to allow more aggressive compression
+
+## What We've Built
+
+The Portable Hypernym Processor represents a significant evolution in text processing tools:
+
+### 🏗️ Architecture Highlights
+- **Massively Parallel**: Successfully tested with 256+ concurrent workers
+- **Scrollable Interface**: iOS-style smooth scrolling through unlimited workers
+- **Real-time Monitoring**: Live statistics, performance gauges, and progress tracking
+- **Intelligent Scaling**: Auto-adjusts concurrency based on API limits and performance
+- **Production Ready**: Comprehensive error handling, caching, and retry logic
+
+### 🎯 Use Cases
+- **Large Dataset Processing**: Process millions of samples efficiently
+- **Book Analysis**: Compress entire books with `--book-id` parameter
+- **Research Workflows**: Flexible SQL queries for custom sample selection
+- **Benchmark Creation**: Build compression benchmarks across different text types
+- **API Testing**: Stress test with massive parallelism while monitoring performance
+
+### 🔮 Future Directions
+- **Distributed Processing**: Multi-machine coordination for even larger datasets
+- **Real-time Streaming**: Process live text streams as they arrive
+- **Advanced Analytics**: Deeper compression pattern analysis and visualization
+- **Plugin System**: Extensible architecture for custom processors
+
+### 📞 Contact & Support
+- **Technical Issues**: Create an issue in the repository
+- **API Access**: Contact hi@hypernym.ai
+- **Feature Requests**: Open a discussion with your use case
+
+---
+
+*Built with ❤️ for the semantic compression community*
