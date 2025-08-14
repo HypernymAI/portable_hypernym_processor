@@ -22,6 +22,7 @@ import hashlib
 import random
 import asyncio
 import math
+import signal
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 import requests
@@ -222,6 +223,8 @@ class HypernymProcessor:
     
     def __init__(self, db_path: str = "portable_hypernym_processor.db", api_key: str = None, api_url: str = None):
         self._tier_access = None  # Cache tier access level
+        self._shutdown_requested = False  # For graceful shutdown
+        self._shutdown_event = asyncio.Event()  # For async shutdown coordination
         """
         Initialize the processor with database and API credentials.
         
@@ -261,6 +264,12 @@ class HypernymProcessor:
         
         # Initialize results storage
         self._init_results_table()
+    
+    def request_shutdown(self):
+        """Request graceful shutdown of all workers"""
+        self._shutdown_requested = True
+        if hasattr(self, '_shutdown_event'):
+            self._shutdown_event.set()
     
     def _init_results_table(self):
         """Create samples, hypernym_responses, and error_entries tables if they don't exist"""
@@ -404,18 +413,52 @@ class HypernymProcessor:
                 
         return samples
     
-    def get_all_samples(self, table_name: str = "samples", limit: int = None) -> List[Sample]:
+    def get_all_samples(self, table_name: str = "samples", limit: int = None, unprocessed_only: bool = True, skip_errors: bool = False) -> List[Sample]:
         """
         Get all samples from a table
         
         Args:
             table_name: Name of the table containing samples
             limit: Maximum number of samples to fetch
+            unprocessed_only: Only get samples not yet processed (default: True)
+            skip_errors: Skip samples that previously had errors (default: False)
             
         Returns:
             List of Sample objects
         """
-        query = f"SELECT * FROM {table_name}"
+        if unprocessed_only:
+            # Get samples that don't have successful responses
+            # This includes both never-processed samples and samples that only have errors
+            # Orders by: 1) Never processed first, 2) Then error samples
+            if skip_errors:
+                # Only get samples that have never been attempted
+                query = f"""
+                    SELECT s.* 
+                    FROM {table_name} s
+                    LEFT JOIN hypernym_responses hr ON s.id = hr.sample_id
+                    LEFT JOIN (SELECT DISTINCT sample_id FROM error_entries) ee ON s.id = ee.sample_id
+                    WHERE hr.sample_id IS NULL  -- No successful response
+                      AND ee.sample_id IS NULL  -- No errors either
+                    ORDER BY s.id
+                """
+            else:
+                # Get all unprocessed, but prioritize never-attempted over errors
+                query = f"""
+                    SELECT s.*, 
+                           CASE 
+                               WHEN hr.sample_id IS NULL AND ee.sample_id IS NULL THEN 0  -- Never processed
+                               WHEN hr.sample_id IS NULL AND ee.sample_id IS NOT NULL THEN 1  -- Only errors
+                               ELSE 2  -- Has successful response
+                           END as priority
+                    FROM {table_name} s
+                    LEFT JOIN hypernym_responses hr ON s.id = hr.sample_id
+                    LEFT JOIN (SELECT DISTINCT sample_id FROM error_entries) ee ON s.id = ee.sample_id
+                    WHERE hr.sample_id IS NULL  -- No successful response
+                    ORDER BY priority, s.id
+                """
+        else:
+            query = f"SELECT * FROM {table_name}"
+            
         if limit:
             query += f" LIMIT {limit}"
         
@@ -1524,6 +1567,16 @@ class HypernymProcessor:
             await update_worker_visibility()
             
             while True:
+                # Check for shutdown request
+                if self._shutdown_requested:
+                    worker_info['current_sample'] = "[yellow]Shutting down...[/yellow]"
+                    if worker_info['visible'] and worker_info['task_id'] is not None:
+                        worker_progress.update(
+                            worker_info['task_id'],
+                            current_sample=worker_info['current_sample']
+                        )
+                    break
+                    
                 try:
                     sample = await queue.get()
                     if sample is None:  # Stop signal
@@ -1619,6 +1672,11 @@ class HypernymProcessor:
                 # Update stats while processing
                 last_scroll = stats['scroll_offset']
                 while any(not w.done() for w in workers):
+                    # Check for shutdown
+                    if self._shutdown_requested:
+                        console.print("\n[yellow]🛑 Shutdown requested, waiting for workers to finish current samples...[/yellow]")
+                        break
+                        
                     stats['animation_frame'] += 1
                     
                     # Check if scroll position changed
@@ -1709,7 +1767,13 @@ class HypernymProcessor:
                 await asyncio.sleep(1)
         
         # Convert results dict to list in original order
-        return [results.get(s.id) for s in samples if s.id in results]
+        processed_results = [results.get(s.id) for s in samples if s.id in results]
+        
+        # If shutdown was requested, print summary
+        if self._shutdown_requested:
+            console.print(f"\n[yellow]⚠️  Shutdown complete. Processed {len(processed_results)}/{len(samples)} samples[/yellow]")
+        
+        return processed_results
 
     def process_batch(self, samples: List[Sample], compression_ratio: float = 0.6,
                      similarity: float = 0.75, batch_size: int = 5,
@@ -2219,11 +2283,18 @@ class HypernymProcessor:
                         # Extract semantic similarity score
                         semantic_similarity = segment.get('semantic_similarity', 0)
                         
-                        # Get the compressed hyperstring from the API response
-                        compressed = response['response']['texts'].get('compressed', '')
+                        # Build hyperstring from segment data
+                        covariant_details = segment.get('covariant_details', [])
+                        if covariant_details:
+                            # Format as "0=text;1=text;2=text"
+                            details_str = ";".join([f"{d['n']}={d['text']}" for d in covariant_details])
+                            hyperstring = f"{semantic_category}::{details_str}"
+                        else:
+                            # No details, just the category
+                            hyperstring = semantic_category
                         
                         # Build segment representation with index marker and similarity score
-                        segment_repr = f"[SEGMENT {idx+1} | similarity: {semantic_similarity:.2f}] {compressed}"
+                        segment_repr = f"[SEGMENT {idx+1} | similarity: {semantic_similarity:.2f}] {hyperstring}"
                             
                         hypernym_parts.append(segment_repr)
                     
@@ -2807,6 +2878,8 @@ Examples:
     
     # Options
     parser.add_argument('--no-cache', action='store_true', help='Disable cache lookup')
+    parser.add_argument('--include-processed', action='store_true', help='Include already processed samples (default: skip them)')
+    parser.add_argument('--skip-errors', action='store_true', help='Skip samples that previously had errors (default: retry them after unprocessed)')
     parser.add_argument('--report', help='Save processing report to file')
     parser.add_argument('--api-key', help='Hypernym API key (overrides env var)')
     parser.add_argument('--api-url', help='Hypernym API URL (overrides env var)')
@@ -2821,6 +2894,13 @@ Examples:
             api_url=args.api_url
         )
         
+        # Set up signal handler for graceful shutdown
+        def signal_handler(signum, frame):
+            print("\n[yellow]🛑 Interrupt received, initiating graceful shutdown...[/yellow]")
+            processor.request_shutdown()
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        
         # Get samples based on selection method
         if args.sample_ids:
             sample_ids = [int(sid.strip()) for sid in args.sample_ids.split(',')]
@@ -2832,13 +2912,24 @@ Examples:
         elif args.query:
             samples = processor.get_samples_by_query(args.query)
         else:  # --all
-            samples = processor.get_all_samples(args.table, args.max_samples)
+            samples = processor.get_all_samples(args.table, args.max_samples, 
+                                               unprocessed_only=not args.include_processed,
+                                               skip_errors=args.skip_errors)
         
         if not samples:
-            print("❌ No samples found")
+            if args.all and not args.include_processed:
+                print("❌ No unprocessed samples found. Use --include-processed to reprocess existing samples.")
+            else:
+                print("❌ No samples found")
             return 1
         
-        print(f"\n📊 Found {len(samples)} samples to process")
+        if args.all and not args.include_processed:
+            if args.skip_errors:
+                print(f"\n📊 Found {len(samples)} never-attempted samples to process (skipping previous errors)")
+            else:
+                print(f"\n📊 Found {len(samples)} unprocessed samples to process (never-attempted will be processed before retrying errors)")
+        else:
+            print(f"\n📊 Found {len(samples)} samples to process")
         
         # Apply max samples limit if specified
         if args.max_samples and len(samples) > args.max_samples:
