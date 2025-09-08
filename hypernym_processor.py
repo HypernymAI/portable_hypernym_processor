@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Portable Hypernym Processor
+Portable Hypernym Processor v2.1.0
 
 A standalone tool for processing text samples from any SQLite database
 through the Hypernym compression API. Works directly with database queries
 without requiring catalog files or the benchmark framework.
+
+Version 2.1.0 - Fixed comprehensive mode for book queries
 
 Usage:
     python hypernym_processor.py --db-path /path/to/database.sqlite --query "SELECT * FROM samples WHERE category='literature' LIMIT 10"
@@ -43,6 +45,7 @@ from rich.align import Align
 # Import our refactored modules
 from core.models import Sample, HypernymResponse
 from core.core.concurrency import AdaptiveConcurrencyManager
+from core.parallel_processor import process_batch_parallel
 
 # Load environment variables from .env file
 load_dotenv()
@@ -115,6 +118,9 @@ class HypernymProcessor:
         
         # Initialize results storage
         self._init_results_table()
+        
+        # Check tier and set appropriate timeout
+        self.check_tier_access()
     
     def request_shutdown(self):
         """Request graceful shutdown of all workers"""
@@ -142,9 +148,35 @@ class HypernymProcessor:
                     response_data TEXT NOT NULL,
                     compression_ratio REAL,
                     processing_time REAL,
+                    analysis_mode TEXT,
+                    ensemble TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(sample_id, request_hash)
                 )
+            """)
+            # Add columns if they don't exist (for existing databases)
+            try:
+                conn.execute("ALTER TABLE hypernym_responses ADD COLUMN analysis_mode TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                conn.execute("ALTER TABLE hypernym_responses ADD COLUMN ensemble TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            
+            # Migrate existing data to new columns (one-time migration)
+            conn.execute("""
+                UPDATE hypernym_responses 
+                SET analysis_mode = COALESCE(
+                    json_extract(response_data, '$.request.params.analysis_mode'),
+                    'partial'
+                )
+                WHERE analysis_mode IS NULL
+            """)
+            conn.execute("""
+                UPDATE hypernym_responses 
+                SET ensemble = json_extract(response_data, '$.metadata.ensemble')
+                WHERE ensemble IS NULL
             """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS error_entries (
@@ -156,6 +188,17 @@ class HypernymProcessor:
                     request_params TEXT,
                     attempt_number INTEGER,
                     content_length INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            # Create separate table for content errors (422s) that should never be retried
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS content_errors (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sample_id INTEGER NOT NULL UNIQUE,
+                    error_message TEXT NOT NULL,
+                    content_length INTEGER,
+                    request_params TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -174,6 +217,14 @@ class HypernymProcessor:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_error_type 
                 ON error_entries(error_type)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_analysis_mode 
+                ON hypernym_responses(analysis_mode)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_ensemble 
+                ON hypernym_responses(ensemble)
             """)
             conn.commit()
     
@@ -264,7 +315,7 @@ class HypernymProcessor:
                 
         return samples
     
-    def get_all_samples(self, table_name: str = "samples", limit: int = None, unprocessed_only: bool = True, skip_errors: bool = False) -> List[Sample]:
+    def get_all_samples(self, table_name: str = "samples", limit: int = None, unprocessed_only: bool = True, skip_errors: bool = False, analysis_mode: str = None) -> List[Sample]:
         """
         Get all samples from a table
         
@@ -273,27 +324,41 @@ class HypernymProcessor:
             limit: Maximum number of samples to fetch
             unprocessed_only: Only get samples not yet processed (default: True)
             skip_errors: Skip samples that previously had errors (default: False)
+            analysis_mode: If specified, only consider samples processed in this mode
             
         Returns:
             List of Sample objects
         """
         if unprocessed_only:
-            # Get samples that don't have successful responses
+            # Get samples that don't have successful responses FOR THE CURRENT MODE
             # This includes both never-processed samples and samples that only have errors
             # Orders by: 1) Never processed first, 2) Then error samples
+            
+            # Build subquery to find samples with successful responses in the current mode
+            if analysis_mode:
+                hr_subquery = f"""(
+                    SELECT DISTINCT sample_id 
+                    FROM hypernym_responses 
+                    WHERE analysis_mode = '{analysis_mode}'
+                )"""
+            else:
+                hr_subquery = "hypernym_responses"
+            
             if skip_errors:
-                # Only get samples that have never been attempted
+                # Only get samples that have never been attempted (excluding content errors)
                 query = f"""
                     SELECT s.* 
                     FROM {table_name} s
-                    LEFT JOIN hypernym_responses hr ON s.id = hr.sample_id
+                    LEFT JOIN {hr_subquery} hr ON s.id = hr.sample_id
                     LEFT JOIN (SELECT DISTINCT sample_id FROM error_entries) ee ON s.id = ee.sample_id
-                    WHERE hr.sample_id IS NULL  -- No successful response
+                    LEFT JOIN content_errors ce ON s.id = ce.sample_id
+                    WHERE hr.sample_id IS NULL  -- No successful response in current mode
                       AND ee.sample_id IS NULL  -- No errors either
+                      AND ce.sample_id IS NULL  -- No content errors (422s)
                     ORDER BY s.id
                 """
             else:
-                # Get all unprocessed, but prioritize never-attempted over errors
+                # Get all unprocessed, but prioritize never-attempted over errors (excluding content errors)
                 query = f"""
                     SELECT s.*, 
                            CASE 
@@ -302,9 +367,11 @@ class HypernymProcessor:
                                ELSE 2  -- Has successful response
                            END as priority
                     FROM {table_name} s
-                    LEFT JOIN hypernym_responses hr ON s.id = hr.sample_id
+                    LEFT JOIN {hr_subquery} hr ON s.id = hr.sample_id
                     LEFT JOIN (SELECT DISTINCT sample_id FROM error_entries) ee ON s.id = ee.sample_id
-                    WHERE hr.sample_id IS NULL  -- No successful response
+                    LEFT JOIN content_errors ce ON s.id = ce.sample_id
+                    WHERE hr.sample_id IS NULL  -- No successful response in current mode
+                      AND ce.sample_id IS NULL  -- No content errors (422s)
                     ORDER BY priority, s.id
                 """
         else:
@@ -362,12 +429,16 @@ class HypernymProcessor:
     def _save_response(self, sample_id: int, request_hash: str, response_data: Dict[str, Any], 
                       compression_ratio: float, processing_time: float):
         """Save response to database"""
+        # Extract analysis_mode and ensemble from response data
+        analysis_mode = response_data.get('request', {}).get('params', {}).get('analysis_mode', 'partial')
+        ensemble = response_data.get('metadata', {}).get('ensemble')
+        
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO hypernym_responses
-                (sample_id, request_hash, response_data, compression_ratio, processing_time)
-                VALUES (?, ?, ?, ?, ?)
-            """, (sample_id, request_hash, json.dumps(response_data), compression_ratio, processing_time))
+                (sample_id, request_hash, response_data, compression_ratio, processing_time, analysis_mode, ensemble)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (sample_id, request_hash, json.dumps(response_data), compression_ratio, processing_time, analysis_mode, ensemble))
             conn.commit()
     
     def _save_error(self, sample_id: int, error_type: str, error_message: str, 
@@ -385,6 +456,20 @@ class HypernymProcessor:
                   attempt_number, content_length))
             conn.commit()
     
+    def _save_content_error(self, sample_id: int, error_message: str, 
+                           request_params: Optional[Dict] = None,
+                           content_length: Optional[int] = None):
+        """Save content error (422) to content_errors table - these are NEVER retried"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO content_errors
+                (sample_id, error_message, request_params, content_length)
+                VALUES (?, ?, ?, ?)
+            """, (sample_id, error_message, 
+                  json.dumps(request_params) if request_params else None,
+                  content_length))
+            conn.commit()
+    
     def process_sample(self, sample: Sample, compression_ratio: float = 0.6, 
                       similarity: float = 0.75, timeout: int = 30,
                       max_retries: int = 3, use_cache: bool = True,
@@ -393,7 +478,8 @@ class HypernymProcessor:
                       force_detail_count: Optional[int] = None,
                       force_single_segment: bool = True,
                       include_embeddings: bool = False,
-                      filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                      filters: Optional[Dict[str, Any]] = None,
+                      ensemble: Optional[str] = None) -> Dict[str, Any]:
         """
         Process a single text sample through Hypernym compression API.
         
@@ -497,6 +583,8 @@ class HypernymProcessor:
                     params['timeout'] = timeout
                 if include_embeddings:
                     params['include_embeddings'] = include_embeddings
+                if ensemble and self.has_northstar_access():
+                    params['ensemble'] = ensemble
                 
                 payload = {
                     'essay_text': sample.content,
@@ -602,6 +690,23 @@ class HypernymProcessor:
                 if hasattr(e, 'response') and hasattr(e.response, 'status_code'):
                     status_code = e.response.status_code
                 
+                # Handle 422 content errors - NEVER retry these
+                if status_code == 422:
+                    error_msg = f"Content rejected (422) - Server cannot process this content type or size. Length: {len(sample.content)} bytes"
+                    self._save_content_error(
+                        sample.id,
+                        error_msg,
+                        request_params=params if 'params' in locals() else None,
+                        content_length=len(sample.content)
+                    )
+                    print(f"🚫 Content rejected permanently for sample {sample.id}")
+                    return {
+                        'success': False,
+                        'sample_id': sample.id,
+                        'error': error_msg
+                    }
+                
+                # For other errors, retry if attempts remain
                 if attempt < max_retries - 1:
                     sleep_time = (2 ** attempt) * (1 + random.random() * 0.2)
                     print(f"⏱️ Retrying in {sleep_time:.1f}s...")
@@ -640,1002 +745,18 @@ class HypernymProcessor:
                                     force_single_segment: bool = True,
                                     include_embeddings: bool = False,
                                     filters: Optional[Dict[str, Any]] = None,
-                                    max_display_workers: int = 20) -> List[Dict[str, Any]]:
+                                    max_display_workers: int = 20,
+                                    ensemble: Optional[str] = None) -> List[Dict[str, Any]]:
         """Process samples in parallel with beautiful progress display"""
-        console = Console()
-        
-        # Create adaptive concurrency manager
-        concurrency_mgr = AdaptiveConcurrencyManager(self, max_workers)
-        
-        # Create progress bars
-        overall_progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]Overall Progress"),
-            BarColumn(bar_width=40),
-            TaskProgressColumn(),
-            TextColumn("•"),
-            TimeElapsedColumn(),
-            TextColumn("•"),
-            TimeRemainingColumn(),
-            console=console,
-            expand=False
+        # Delegate to the extracted parallel processor module
+        return await process_batch_parallel(
+            self, samples, compression_ratio, similarity, batch_size,
+            cooldown, batch_cooldown, timeout, max_retries, use_cache,
+            max_workers, analysis_mode, force_detail_count,
+            force_single_segment, include_embeddings, filters,
+            max_display_workers, ensemble
         )
-        
-        # Worker progress will show a scrollable window
-        worker_progress = Progress(
-            TextColumn("[bold cyan]{task.fields[worker_name]:>10}"),
-            SpinnerColumn(),
-            BarColumn(bar_width=30),
-            TaskProgressColumn(),
-            TextColumn("[dim]{task.fields[current_sample]}"),
-            console=console,
-            expand=False
-        )
-        
-        # Track all worker tasks (even if not visible)
-        all_worker_tasks = []
-        
-        # Get historical data from database for accurate averages
-        async def get_historical_stats():
-            """Pull historical compression and similarity data from database"""
-            historical = {
-                'all_compressions': [],
-                'all_similarities': [],
-                'best_compression': 1.0,
-                'best_similarity': 0.0
-            }
-            
-            try:
-                async with aiosqlite.connect(self.db_path) as db:
-                    # Get all compression ratios and similarities
-                    cursor = await db.execute("""
-                        SELECT response_data, compression_ratio 
-                        FROM hypernym_responses 
-                        WHERE compression_ratio > 0
-                    """)
-                    rows = await cursor.fetchall()
-                    
-                    for row in rows:
-                        compression_ratio = row[1]
-                        response_data = json.loads(row[0])
-                        
-                        # Track compression
-                        if compression_ratio > 0:
-                            historical['all_compressions'].append(compression_ratio)
-                            if compression_ratio < historical['best_compression']:
-                                historical['best_compression'] = compression_ratio
-                        
-                        # Extract similarity from response
-                        try:
-                            if 'results' in response_data:
-                                segments = response_data['results'].get('response', {}).get('segments', [])
-                            else:
-                                segments = response_data.get('response', {}).get('segments', [])
-                            
-                            if segments:
-                                similarities = [s.get('semantic_similarity', 0) for s in segments if 'semantic_similarity' in s]
-                                if similarities:
-                                    avg_sim = sum(similarities) / len(similarities)
-                                    historical['all_similarities'].append(avg_sim)
-                                    if avg_sim > historical['best_similarity']:
-                                        historical['best_similarity'] = avg_sim
-                        except:
-                            pass
-                            
-            except Exception as e:
-                console.print(f"[yellow]⚠️  Could not load historical data: {e}[/yellow]")
-            
-            return historical
-        
-        # Stats tracking
-        # Get total already processed count
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("""
-                SELECT COUNT(DISTINCT sample_id) 
-                FROM hypernym_responses
-            """) as cursor:
-                row = await cursor.fetchone()
-                total_already_processed = row[0] if row else 0
-        
-        historical_data = await get_historical_stats()
-        stats = {
-            'processed': 0,
-            'errors': 0,
-            'cache_hits': 0,
-            'rate_limited': 0,
-            'start_time': time.time(),
-            'recent_compressions': [],  # Track last 10 compression ratios
-            'recent_similarities': [],  # Track last 10 similarity scores
-            'all_compressions': historical_data['all_compressions'],  # ALL historical data
-            'all_similarities': historical_data['all_similarities'],  # ALL historical data
-            'best_compression': historical_data['best_compression'],
-            'best_similarity': historical_data['best_similarity'],
-            'animation_frame': 0,
-            'scroll_offset': 0,  # For scrolling through workers
-            'max_scroll': 0,  # Will be set based on worker count
-            'total_in_db': total_already_processed  # Total already processed
-        }
-        
-        # Keyboard input handling
-        import sys, tty, termios, select
-        import threading
-        
-        def handle_keyboard():
-            """Handle keyboard input for scrolling"""
-            old_settings = termios.tcgetattr(sys.stdin)
-            try:
-                tty.setcbreak(sys.stdin.fileno())
-                while True:
-                    if select.select([sys.stdin], [], [], 0)[0]:
-                        key = sys.stdin.read(1)
-                        if key == '\x1b':  # ESC sequence
-                            next_chars = sys.stdin.read(2)
-                            if next_chars == '[A':  # Up arrow
-                                stats['scroll_offset'] = max(0, stats['scroll_offset'] - 1)
-                            elif next_chars == '[B':  # Down arrow  
-                                stats['scroll_offset'] = min(stats['max_scroll'], stats['scroll_offset'] + 1)
-                            elif next_chars == '[5':  # Page up
-                                if sys.stdin.read(1) == '~':
-                                    stats['scroll_offset'] = max(0, stats['scroll_offset'] - 18)
-                            elif next_chars == '[6':  # Page down
-                                if sys.stdin.read(1) == '~':
-                                    stats['scroll_offset'] = min(stats['max_scroll'], stats['scroll_offset'] + 18)
-                    time.sleep(0.05)
-            finally:
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        
-        # Start keyboard thread
-        keyboard_thread = threading.Thread(target=handle_keyboard, daemon=True)
-        keyboard_thread.start()
-        
-        # Results storage
-        results = {}
-        
-        def create_average_banners():
-            """Create Megaman-style banners showing averages"""
-            # Calculate averages from historical data
-            avg_compression = sum(stats['all_compressions']) / len(stats['all_compressions']) if stats['all_compressions'] else 0.0
-            avg_similarity = sum(stats['all_similarities']) / len(stats['all_similarities']) if stats['all_similarities'] else 0.0
-            
-            banner_lines = []
-            
-            # Compression banner
-            comp_percent = (1 - avg_compression) * 100
-            comp_bar = "█" * int(comp_percent / 5)  # 20 blocks max
-            banner_lines.append(f"[bold yellow]╔═══════════════════════════╗[/bold yellow]")
-            banner_lines.append(f"[bold yellow]║[/bold yellow] [bold red]⚡ COMPRESSION POWER ⚡[/bold red]   [bold yellow]║[/bold yellow]")
-            banner_lines.append(f"[bold yellow]╠═══════════════════════════╣[/bold yellow]")
-            banner_lines.append(f"[bold yellow]║[/bold yellow] [{comp_bar:<23}] [bold yellow]║[/bold yellow]")
-            banner_lines.append(f"[bold yellow]║[/bold yellow]           [bold white]{comp_percent:>5.1f}%[/bold white]          [bold yellow]║[/bold yellow]")
-            banner_lines.append(f"[bold yellow]╚═══════════════════════════╝[/bold yellow]")
-            
-            banner_lines.append("")  # Spacer
-            
-            # Similarity banner
-            sim_percent = avg_similarity * 100
-            sim_bar = "█" * int(sim_percent / 5)  # 20 blocks max
-            banner_lines.append(f"[bold cyan]╔═══════════════════════════╗[/bold cyan]")
-            banner_lines.append(f"[bold cyan]║[/bold cyan] [bold blue]💎 SIMILARITY SHIELD 💎[/bold blue]   [bold cyan]║[/bold cyan]")
-            banner_lines.append(f"[bold cyan]╠═══════════════════════════╣[/bold cyan]")
-            banner_lines.append(f"[bold cyan]║[/bold cyan] [{sim_bar:<23}] [bold cyan]║[/bold cyan]")
-            banner_lines.append(f"[bold cyan]║[/bold cyan]           [bold white]{sim_percent:>5.1f}%[/bold white]          [bold cyan]║[/bold cyan]")
-            banner_lines.append(f"[bold cyan]╚═══════════════════════════╝[/bold cyan]")
-            
-            banner_lines.append("")  # Spacer
-            
-            # Sample count
-            banner_lines.append(f"[dim]Historical samples: {len(stats['all_compressions']):,}[/dim]")
-            
-            # Combo meter
-            if comp_percent > 70 and sim_percent > 85:
-                banner_lines.append("")
-                banner_lines.append("[bold red on yellow blink]★ MEGA COMBO ACTIVE ★[/bold red on yellow blink]")
-            
-            return "\n".join(banner_lines)
-        
-        def create_best_scores_display():
-            """Create display with 1D violin plots using exact style requested"""
-            lines = []
-            
-            # Calculate statistics for all samples
-            if stats['all_compressions']:
-                comp_values = [(1-x)*100 for x in stats['all_compressions']]  # Convert to percentage
-                comp_min = min(comp_values)
-                comp_max = max(comp_values)
-                comp_avg = sum(comp_values) / len(comp_values)
-                comp_q1 = sorted(comp_values)[len(comp_values)//4]
-                comp_q3 = sorted(comp_values)[3*len(comp_values)//4]
-                
-                # Calculate standard deviation
-                comp_std = (sum((x - comp_avg) ** 2 for x in comp_values) / len(comp_values)) ** 0.5
-                
-                # Create violin plot for compression: ||---===|~~~~|===---||
-                lines.append("[bold red]🏆 COMPRESSION[/bold red]")
-                lines.append(f"Best: [bold yellow]{comp_max:.1f}%[/bold yellow]  Avg: {comp_avg:.1f}%")
-                
-                # Build violin plot: ||---------======|~~~~|==-----||
-                graph_width = 40
-                
-                # Calculate standard error for error bars
-                comp_se = comp_std / (len(comp_values) ** 0.5)
-                
-                # Map values to positions on the graph
-                min_pos = int(comp_min / 100 * graph_width)
-                max_pos = int(comp_max / 100 * graph_width)
-                q1_pos = int(comp_q1 / 100 * graph_width)
-                q3_pos = int(comp_q3 / 100 * graph_width)
-                avg_pos = int(comp_avg / 100 * graph_width)
-                error_left = int((comp_avg - comp_se) / 100 * graph_width)
-                error_right = int((comp_avg + comp_se) / 100 * graph_width)
-                
-                # Build the violin character by character
-                violin = ""
-                i = 0
-                while i < graph_width:
-                    if i == min_pos:
-                        violin += "||"
-                        i += 2
-                    elif i == max_pos and max_pos != min_pos + 1:
-                        violin += "||"
-                        i += 2
-                    elif i == error_left:
-                        violin += "|"
-                        i += 1
-                    elif i == error_right:
-                        violin += "|"
-                        i += 1
-                    elif i > error_left and i < error_right:
-                        violin += "~"
-                        i += 1
-                    elif i >= q1_pos and i <= q3_pos:
-                        violin += "="
-                        i += 1
-                    elif i > min_pos and i < q1_pos:
-                        violin += "-"
-                        i += 1
-                    elif i > q3_pos and i < max_pos:
-                        violin += "-"
-                        i += 1
-                    else:
-                        violin += " "
-                        i += 1
-                
-                lines.append(violin)
-                lines.append(f"0%{' ' * 18}50%{' ' * 17}100%")
-                lines.append("")
-            
-            # Similar for similarity scores
-            if stats['all_similarities']:
-                sim_values = [x*100 for x in stats['all_similarities']]
-                sim_min = min(sim_values)
-                sim_max = max(sim_values)
-                sim_avg = sum(sim_values) / len(sim_values)
-                sim_q1 = sorted(sim_values)[len(sim_values)//4]
-                sim_q3 = sorted(sim_values)[3*len(sim_values)//4]
-                
-                # Calculate standard deviation
-                sim_std = (sum((x - sim_avg) ** 2 for x in sim_values) / len(sim_values)) ** 0.5
-                
-                lines.append("[bold cyan]🏆 SIMILARITY[/bold cyan]")
-                lines.append(f"Best: [bold green]{sim_max:.1f}%[/bold green]  Avg: {sim_avg:.1f}%")
-                
-                # Build violin plot: ||---------======|~~~~|==-----||
-                graph_width = 40
-                
-                # Calculate standard error for error bars
-                sim_se = sim_std / (len(sim_values) ** 0.5)
-                
-                # Map values to positions on the graph
-                min_pos = int(sim_min / 100 * graph_width)
-                max_pos = int(sim_max / 100 * graph_width)
-                q1_pos = int(sim_q1 / 100 * graph_width)
-                q3_pos = int(sim_q3 / 100 * graph_width)
-                avg_pos = int(sim_avg / 100 * graph_width)
-                error_left = int((sim_avg - sim_se) / 100 * graph_width)
-                error_right = int((sim_avg + sim_se) / 100 * graph_width)
-                
-                # Build the violin character by character
-                violin = ""
-                i = 0
-                while i < graph_width:
-                    if i == min_pos:
-                        violin += "||"
-                        i += 2
-                    elif i == max_pos and max_pos != min_pos + 1:
-                        violin += "||"
-                        i += 2
-                    elif i == error_left:
-                        violin += "|"
-                        i += 1
-                    elif i == error_right:
-                        violin += "|"
-                        i += 1
-                    elif i > error_left and i < error_right:
-                        violin += "~"
-                        i += 1
-                    elif i >= q1_pos and i <= q3_pos:
-                        violin += "="
-                        i += 1
-                    elif i > min_pos and i < q1_pos:
-                        violin += "-"
-                        i += 1
-                    elif i > q3_pos and i < max_pos:
-                        violin += "-"
-                        i += 1
-                    else:
-                        violin += " "
-                        i += 1
-                
-                lines.append(violin)
-                lines.append(f"0%{' ' * 18}50%{' ' * 17}100%")
-                lines.append("")
-            
-            lines.append(f"[dim]Total samples: {len(stats['all_compressions']):,}[/dim]")
-            
-            return "\n".join(lines)
-        
-        def create_pinball_animation():
-            """Create display with two ASCII graphs"""
-            # Get last 50 samples for graphs
-            recent_comp = stats['all_compressions'][-50:] if len(stats['all_compressions']) > 50 else stats['all_compressions']
-            recent_sim = stats['all_similarities'][-50:] if len(stats['all_similarities']) > 50 else stats['all_similarities']
-            
-            # Build display
-            display = []
-            display.append("╔" + "═" * 95 + "╗")
-            display.append("║" + " " * 32 + "🎮 HYPERNYM PERFORMANCE 🎮" + " " * 33 + "║")
-            display.append("╠" + "═" * 95 + "╣")
-            display.append("║" + " " * 95 + "║")
-            
-            # Best scores boxes
-            display.append("║ ┌─────────────────────────┐" + " " * 41 + "┌─────────────────────────┐ ║")
-            display.append(f"║ │ 🏆 BEST COMPRESSION: {(1-stats['best_compression'])*100:>3.0f}% │" + " " * 41 + f"│ 🏆 BEST SIMILARITY: {stats['best_similarity']*100:>3.0f}% │ ║")
-            display.append("║ └─────────────────────────┘" + " " * 41 + "└─────────────────────────┘ ║")
-            display.append("║" + " " * 95 + "║")
-            
-            # Graph headers
-            display.append("║ Compression History (last 50 samples)" + " " * 18 + "Similarity History (last 50 samples)   ║")
-            
-            # Create ASCII graphs
-            if recent_comp and recent_sim:
-                # Calculate ranges
-                comp_values = [(1-x)*100 for x in recent_comp]  # Convert to percentage
-                sim_values = [x*100 for x in recent_sim]
-                
-                # Create line graph for compression
-                comp_graph = []
-                for y in range(100, 40, -10):  # 100% to 50% 
-                    line = f"{y:>3}%┤"
-                    for i, val in enumerate(comp_values[-30:]):  # Last 30 points
-                        if i == 0:
-                            line += " "
-                        elif abs(val - y) < 5:
-                            line += "═"
-                        elif comp_values[i-1] < y < val or val < y < comp_values[i-1]:
-                            line += "╱" if val > comp_values[i-1] else "╲"
-                        else:
-                            line += " "
-                    comp_graph.append(line)
-                
-                # Create bar graph for similarity
-                sim_graph = []
-                sim_avg = sum(sim_values) / len(sim_values)
-                sim_min = min(sim_values)
-                sim_max = max(sim_values)
-                
-                for y in range(100, 40, -10):
-                    line = f"{y:>3}%┤"
-                    if sim_min <= y <= sim_max:
-                        if abs(y - sim_avg) < 5:
-                            line += "═" * 30
-                        else:
-                            line += "║" + " " * 28 + "║"
-                    else:
-                        line += " " * 30
-                    sim_graph.append(line)
-                
-                # Display graphs side by side
-                for i in range(len(comp_graph)):
-                    display.append(f"║ {comp_graph[i]:<44} {sim_graph[i]:<45} ║")
-                
-                # Graph bottom line
-                display.append("║    └" + "─" * 30 + " " * 14 + "└" + "─" * 30 + " ║")
-                
-                # Stats
-                comp_avg = sum(comp_values) / len(comp_values)
-                sim_avg = sum(sim_values) / len(sim_values)
-                display.append(f"║    [Min: {min(comp_values):>2.0f}%  Avg: {comp_avg:>2.0f}%  Max: {max(comp_values):>2.0f}%]" + 
-                             " " * 19 + 
-                             f"[Min: {min(sim_values):>2.0f}%  Avg: {sim_avg:>2.0f}%  Max: {max(sim_values):>2.0f}%]   ║")
-            else:
-                # No data message
-                for _ in range(8):
-                    display.append("║" + " " * 95 + "║")
-                display.append("║" + " " * 40 + "[No data yet]" + " " * 42 + "║")
-            
-            display.append("╚" + "═" * 95 + "╝")
-            
-            return "\n".join(display)
-        
-        def make_stats_table():
-            """Create stats table"""
-            table = Table(show_header=False, box=None, padding=(0, 2))
-            
-            elapsed = time.time() - stats['start_time']
-            rate = stats['processed'] / elapsed if elapsed > 0 else 0
-            
-            table.add_row("[green]✓ Processed", f"[bold green]{stats['processed']:,}")
-            table.add_row("[yellow]⚡ Cache Hits", f"[bold yellow]{stats['cache_hits']:,}")
-            table.add_row("[red]✗ Errors", f"[bold red]{stats['errors']:,}")
-            table.add_row("[magenta]⏱ Rate Limited", f"[bold magenta]{stats['rate_limited']:,}")
-            table.add_row("[blue]⚡ Rate", f"[bold blue]{rate:.1f}/sec")
-            table.add_row("[cyan]👷 Workers", f"[bold cyan]{concurrency_mgr.current_workers}/{concurrency_mgr.max_workers}")
-            
-            return table
-        
-        def make_layout(num_workers, max_display_workers=20):
-            """Create the layout"""
-            layout = Layout()
-            
-            # Calculate optimal progress panel size based on max_display_workers
-            worker_panel_size = min(max(num_workers, 10), max_display_workers)
-            progress_panel_size = worker_panel_size + 3  # +3 for overall progress bar
-            
-            layout.split_column(
-                Layout(name="header", size=3),
-                Layout(name="progress", size=progress_panel_size),
-                Layout(name="bottom")
-            )
-            
-            # Split bottom section into stats and best scores
-            layout["bottom"].split_row(
-                Layout(name="stats", ratio=1),
-                Layout(name="best_scores", ratio=1)
-            )
-            
-            layout["header"].update(
-                Panel(
-                    Align.center(
-                        f"[bold][rgb(164,27,27)]H[/rgb(164,27,27)][rgb(247,185,121)]Y[/rgb(247,185,121)][rgb(196,153,21)]P[/rgb(196,153,21)][rgb(68,126,42)]E[/rgb(68,126,42)][rgb(85,140,152)]R[/rgb(85,140,152)][rgb(81,135,220)]N[/rgb(81,135,220)][rgb(167,202,234)]Y[/rgb(167,202,234)][rgb(59,46,98)]M[/rgb(59,46,98)] Parallel Processor[/bold]\n"
-                        f"[dim]{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[/dim]",
-                        vertical="middle"
-                    ),
-                    border_style="blue"
-                )
-            )
-            
-            
-            # Create progress panels layout
-            progress_left = Layout()
-            
-            # Calculate visible range based on scroll offset
-            visible_start = stats.get('scroll_offset', 0)
-            visible_end = min(visible_start + max_display_workers, num_workers)
-            
-            # Create scrolling indicator
-            if num_workers > max_display_workers:
-                # Calculate position for iOS-style scrollbar
-                scroll_percent = visible_start / max(1, num_workers - max_display_workers)
-                position_text = f"[{visible_start+1}-{visible_end}/{num_workers}]"
-                
-                # Add scroll indicators
-                scroll_info = "↑/↓: scroll 1 | PgUp/PgDn: scroll 18"
-                
-                worker_panel_content = Panel(
-                    worker_progress, 
-                    border_style="cyan",
-                    title=f"[bold cyan]Workers {position_text}[/bold cyan]",
-                    subtitle=f"[dim]{scroll_info}[/dim]"
-                )
-            else:
-                worker_panel_content = Panel(worker_progress, border_style="cyan")
-            
-            progress_left.split_column(
-                Layout(Panel(overall_progress, border_style="green"), size=3),
-                Layout(worker_panel_content)
-            )
-            
-            # Split progress into left (bars) and right (banners)
-            progress_content = Layout()
-            progress_content.split_row(
-                Layout(progress_left, ratio=3),
-                Layout(
-                    Panel(
-                        Align.center(create_average_banners(), vertical="middle"),
-                        title="[bold magenta]📊 Performance Meters 📊[/bold magenta]",
-                        border_style="magenta"
-                    ),
-                    ratio=1
-                )
-            )
-            layout["progress"].update(progress_content)
-            
-            layout["stats"].update(
-                Panel(
-                    Align.center(make_stats_table(), vertical="middle"),
-                    title="[bold]Statistics[/bold]",
-                    border_style="yellow"
-                )
-            )
-            
-            layout["best_scores"].update(
-                Panel(
-                    Align.center(create_best_scores_display(), vertical="middle"),
-                    title="[bold]🏆 High Scores 🏆[/bold]",
-                    border_style="green"
-                )
-            )
-            
-            return layout
-        
-        async def process_sample_async(self, session, sample, worker_id, worker_task):
-            """Process a single sample asynchronously"""
-            # Find worker info
-            worker_info = None
-            for info in all_worker_tasks:
-                if info['id'] == worker_id:
-                    worker_info = info
-                    break
-            
-            # Update display if visible
-            if worker_info:
-                worker_info['current_sample'] = f"Sample #{sample.id:04d}"
-                if worker_info['visible'] and worker_info['task_id'] is not None:
-                    worker_progress.update(
-                        worker_info['task_id'],
-                        current_sample=worker_info['current_sample']
-                    )
-            
-            # Generate request hash for caching
-            request_hash = self._get_request_hash(
-                sample.content, compression_ratio, similarity,
-                analysis_mode, force_detail_count, force_single_segment, filters
-            )
-            
-            # Check cache
-            if use_cache:
-                cached = self._check_cache(sample.id, request_hash)
-                if cached:
-                    stats['processed'] += 1
-                    stats['cache_hits'] += 1
-                    if worker_info:
-                        worker_info['current_sample'] = f"Sample #{sample.id:04d} [yellow](cached)[/yellow]"
-                        if worker_info['visible'] and worker_info['task_id'] is not None:
-                            worker_progress.update(
-                                worker_info['task_id'],
-                                current_sample=worker_info['current_sample']
-                            )
-                    return {
-                        'success': True,
-                        'sample_id': sample.id,
-                        'compression_ratio': cached['compression_ratio'],
-                        'processing_time': cached['processing_time'],
-                        'cached': True,
-                        'response': cached['response_data']
-                    }
-            
-            # Make API request
-            try:
-                headers = {
-                    'X-API-Key': self.api_key,
-                    'Content-Type': 'application/json'
-                }
-                
-                params = {
-                    'min_compression_ratio': compression_ratio,
-                    'min_semantic_similarity': similarity
-                }
-                
-                if analysis_mode != "partial":
-                    params['analysis_mode'] = analysis_mode
-                if force_detail_count is not None:
-                    params['force_detail_count'] = force_detail_count
-                if force_single_segment:
-                    params['force_single_segment'] = force_single_segment
-                if timeout != 60:
-                    params['timeout'] = timeout
-                if include_embeddings:
-                    params['include_embeddings'] = include_embeddings
-                
-                payload = {
-                    'essay_text': sample.content,
-                    'params': params
-                }
-                
-                if filters:
-                    payload['filters'] = filters
-                
-                start_time = time.time()
-                
-                async with session.post(
-                    self.api_url,
-                    headers=headers,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=timeout)
-                ) as response:
-                    if response.status == 429:
-                        stats['rate_limited'] += 1
-                        concurrency_mgr.record_rate_limit()
-                        if worker_info:
-                            worker_info['current_sample'] = f"Sample #{sample.id:04d} [magenta](rate limited)[/magenta]"
-                            if worker_info['visible'] and worker_info['task_id'] is not None:
-                                worker_progress.update(
-                                    worker_info['task_id'],
-                                    current_sample=worker_info['current_sample']
-                                )
-                        # Exponential backoff with jitter
-                        backoff = min(60, 2 ** stats.get('rate_limit_retries', 0) + random.random())
-                        await asyncio.sleep(backoff)
-                        stats['rate_limit_retries'] = stats.get('rate_limit_retries', 0) + 1
-                        raise Exception("Rate limited")
-                    
-                    response.raise_for_status()
-                    result = await response.json()
-                
-                processing_time = time.time() - start_time
-                
-                # Extract compression ratio
-                if 'results' in result:
-                    v2_response = result['results']
-                else:
-                    v2_response = result
-                
-                segments = v2_response.get('response', {}).get('segments', [])
-                
-                # Check for no_results flag (Zone 1/2 responses)
-                no_results = result.get('metadata', {}).get('no_results', False)
-                
-                if segments:
-                    segment_ratios = [s.get('compression_ratio', 0) for s in segments]
-                    actual_ratio = sum(segment_ratios) / len(segment_ratios) if segment_ratios else 0.0
-                elif no_results:
-                    # This is a valid Zone 1/2 response - short text that can't be compressed
-                    # Set ratio to 1.0 (no compression) to indicate it's processed but not compressed
-                    actual_ratio = 1.0
-                else:
-                    actual_ratio = 0.0
-                
-                # Extract similarity scores from segments
-                avg_similarity = 0.75  # default
-                if segments:
-                    similarities = [s.get('semantic_similarity', 0.75) for s in segments if 'semantic_similarity' in s]
-                    if similarities:
-                        avg_similarity = sum(similarities) / len(similarities)
-                
-                # Track recent metrics for animation
-                stats['recent_compressions'].append(actual_ratio)
-                stats['recent_similarities'].append(avg_similarity)
-                # Keep only last 10
-                if len(stats['recent_compressions']) > 10:
-                    stats['recent_compressions'].pop(0)
-                if len(stats['recent_similarities']) > 10:
-                    stats['recent_similarities'].pop(0)
-                
-                # Track ALL metrics for high scores
-                stats['all_compressions'].append(actual_ratio)
-                stats['all_similarities'].append(avg_similarity)
-                
-                # Update high scores
-                if actual_ratio < stats['best_compression']:
-                    stats['best_compression'] = actual_ratio
-                if avg_similarity > stats['best_similarity']:
-                    stats['best_similarity'] = avg_similarity
-                
-                # Save to cache
-                self._save_response(sample.id, request_hash, result, actual_ratio, processing_time)
-                
-                stats['processed'] += 1
-                concurrency_mgr.record_success(processing_time)
-                
-                return {
-                    'success': True,
-                    'sample_id': sample.id,
-                    'compression_ratio': actual_ratio,
-                    'processing_time': processing_time,
-                    'cached': False,
-                    'response': result
-                }
-                
-            except Exception as e:
-                stats['errors'] += 1
-                concurrency_mgr.record_error()
-                error_type = type(e).__name__
-                error_msg = str(e)
-                
-                # Extract status code if available
-                status_code = None
-                if hasattr(e, 'status'):
-                    status_code = e.status
-                
-                # Enhanced error message for 408 timeouts
-                if status_code == 408:
-                    error_msg = f"Server timeout (408) at {self.api_url} - Server returned timeout status, not a client timeout. Content length: {len(sample.content)} bytes"
-                    console.print(f"[yellow]⚠️  408 Timeout from server for sample {sample.id} ({len(sample.content)} bytes)[/yellow]")
-                    console.print(f"[yellow]    URL: {self.api_url}[/yellow]")
-                    console.print(f"[yellow]    This is a server-side timeout, not a client timeout[/yellow]")
-                
-                # Save error to database
-                self._save_error(
-                    sample.id,
-                    error_type,
-                    error_msg,
-                    status_code=status_code,
-                    request_params={
-                        'min_compression_ratio': compression_ratio,
-                        'min_semantic_similarity': similarity,
-                        'analysis_mode': analysis_mode,
-                        'force_detail_count': force_detail_count,
-                        'force_single_segment': force_single_segment
-                    },
-                    attempt_number=1,  # Async version doesn't retry
-                    content_length=len(sample.content)
-                )
-                
-                if worker_info:
-                    worker_info['current_sample'] = f"Sample #{sample.id:04d} [red](failed: {str(e)})[/red]"
-                    if worker_info['visible'] and worker_info['task_id'] is not None:
-                        worker_progress.update(
-                            worker_info['task_id'],
-                            current_sample=worker_info['current_sample']
-                        )
-                return {
-                    'success': False,
-                    'sample_id': sample.id,
-                    'error': str(e)
-                }
-        
-        async def update_worker_visibility():
-            """Update which workers are visible based on scroll offset"""
-            visible_start = stats['scroll_offset']
-            visible_end = visible_start + max_display_workers
-            
-            # Clear all current tasks
-            for task_id in worker_progress.task_ids:
-                worker_progress.remove_task(task_id)
-            
-            # Add visible workers
-            for i, worker_info in enumerate(all_worker_tasks):
-                if visible_start <= i < visible_end:
-                    task = worker_progress.add_task(
-                        f"Worker {worker_info['id']}",
-                        total=worker_info['total'],
-                        completed=worker_info['completed'],
-                        worker_name=f"Worker {worker_info['id']}",
-                        current_sample=worker_info['current_sample']
-                    )
-                    worker_info['task_id'] = task
-                    worker_info['visible'] = True
-                else:
-                    worker_info['visible'] = False
-                    worker_info['task_id'] = None
-        
-        async def worker(self, session, worker_id, queue, overall_task, samples_per_worker):
-            """Worker coroutine"""
-            worker_samples_processed = 0
-            
-            # Store task info for scrolling
-            worker_info = {
-                'id': worker_id,
-                'visible': False,
-                'task_id': None,
-                'total': samples_per_worker,
-                'completed': 0,
-                'current_sample': "Starting..."
-            }
-            all_worker_tasks.append(worker_info)
-            
-            # Initial visibility check
-            await update_worker_visibility()
-            
-            while True:
-                # Check for shutdown request
-                if self._shutdown_requested:
-                    worker_info['current_sample'] = "[yellow]Shutting down...[/yellow]"
-                    if worker_info['visible'] and worker_info['task_id'] is not None:
-                        worker_progress.update(
-                            worker_info['task_id'],
-                            current_sample=worker_info['current_sample']
-                        )
-                    break
-                    
-                try:
-                    sample = await queue.get()
-                    if sample is None:  # Stop signal
-                        break
-                    
-                    # Process the sample
-                    result = await process_sample_async(self, session, sample, worker_id, worker_info['task_id'])
-                    results[sample.id] = result
-                    
-                    # Update worker stats
-                    worker_samples_processed += 1
-                    worker_info['completed'] = worker_samples_processed
-                    worker_info['current_sample'] = f"Sample #{sample.id:04d} [green](done)[/green]"
-                    
-                    # Update progress bar if visible
-                    if worker_info['visible'] and worker_info['task_id'] is not None:
-                        worker_progress.update(
-                            worker_info['task_id'],
-                            completed=worker_samples_processed,
-                            current_sample=worker_info['current_sample'],
-                            samples_count=worker_samples_processed
-                        )
-                    
-                    # Update overall progress
-                    overall_progress.advance(overall_task)
-                    
-                    queue.task_done()
-                    
-                except Exception as e:
-                    worker_info['current_sample'] = f"[red]Error: {str(e)}[/red]"
-                    if worker_info['visible'] and worker_info['task_id'] is not None:
-                        worker_progress.update(
-                            worker_info['task_id'],
-                            current_sample=worker_info['current_sample']
-                        )
-            
-            worker_info['current_sample'] = "[green]Complete[/green]"
-            if worker_info['visible'] and worker_info['task_id'] is not None:
-                worker_progress.update(
-                    worker_info['task_id'],
-                    current_sample=worker_info['current_sample']
-                )
-        
-        # Create overall task
-        overall_task = overall_progress.add_task(
-            "Processing samples",
-            total=len(samples)
-        )
-        
-        # Create work queue
-        queue = asyncio.Queue()
-        for sample in samples:
-            await queue.put(sample)
-        
-        # Adjust worker count if we have fewer samples than workers
-        actual_workers = min(max_workers, len(samples))
-        
-        # Set max scroll based on workers that won't fit
-        stats['max_scroll'] = max(0, actual_workers - max_display_workers)
-        
-        # Create layout
-        layout = make_layout(actual_workers, max_display_workers)
-        
-        # Create aiohttp session
-        async with aiohttp.ClientSession() as session:
-            # Query rate limits first
-            console.print("🔍 Querying API rate limits...")
-            limits = await concurrency_mgr.get_rate_limits(session)
-            if limits:
-                console.print(f"✅ Rate limits: {limits['limits']['requests_per_hour']:,}/hour, "
-                            f"recommended {limits['recommended']['max_workers']} workers")
-                console.print(f"🚀 Starting with {concurrency_mgr.current_workers} workers "
-                            f"(will scale up to {concurrency_mgr.max_workers})")
-            else:
-                console.print(f"⚠️  Using default: {concurrency_mgr.current_workers} workers")
-            
-            await asyncio.sleep(1)  # Brief pause to read the info
-            
-            with Live(layout, console=console, refresh_per_second=10):
-                # Start with adaptive number of workers
-                active_workers = min(concurrency_mgr.current_workers, actual_workers)
-                samples_per_worker = max(1, len(samples) // active_workers)
-                
-                workers = [
-                    asyncio.create_task(worker(self, session, i+1, queue, overall_task, samples_per_worker))
-                    for i in range(active_workers)
-                ]
-                
-                # Add stop signals immediately after creating workers
-                for _ in range(active_workers):
-                    await queue.put(None)
-                
-                # Update stats while processing
-                last_scroll = stats['scroll_offset']
-                while any(not w.done() for w in workers):
-                    # Check for shutdown
-                    if self._shutdown_requested:
-                        console.print("\n[yellow]🛑 Shutdown requested, waiting for workers to finish current samples...[/yellow]")
-                        break
-                        
-                    stats['animation_frame'] += 1
-                    
-                    # Check if scroll position changed
-                    if stats['scroll_offset'] != last_scroll:
-                        await update_worker_visibility()
-                        last_scroll = stats['scroll_offset']
-                    
-                    # Calculate visible range for dynamic panel title
-                    visible_start = stats['scroll_offset']
-                    visible_end = min(visible_start + max_display_workers, actual_workers)
-                    
-                    # Update progress section with banners
-                    progress_left = Layout()
-                    
-                    # Create worker panel with scroll info
-                    if actual_workers > max_display_workers:
-                        position_text = f"[{visible_start+1}-{visible_end}/{actual_workers}]"
-                        scroll_info = "↑/↓: scroll 1 | PgUp/PgDn: scroll 18"
-                        worker_panel = Panel(
-                            worker_progress,
-                            border_style="cyan",
-                            title=f"[bold cyan]Workers {position_text}[/bold cyan]",
-                            subtitle=f"[dim]{scroll_info}[/dim]"
-                        )
-                    else:
-                        worker_panel = Panel(worker_progress, border_style="cyan")
-                    
-                    progress_left.split_column(
-                        Layout(Panel(overall_progress, border_style="green"), size=3),
-                        Layout(worker_panel)
-                    )
-                    
-                    progress_content = Layout()
-                    progress_content.split_row(
-                        Layout(progress_left, ratio=3),
-                        Layout(
-                            Panel(
-                                Align.center(create_average_banners(), vertical="middle"),
-                                title="[bold magenta]📊 Performance Meters 📊[/bold magenta]",
-                                border_style="magenta"
-                            ),
-                            ratio=1
-                        )
-                    )
-                    layout["progress"].update(progress_content)
-                    
-                    # Update stats panel
-                    layout["stats"].update(
-                        Panel(
-                            Align.center(make_stats_table(), vertical="middle"),
-                            title="[bold]Statistics[/bold]",
-                            border_style="yellow"
-                        )
-                    )
-                    
-                    # Update best scores panel
-                    layout["best_scores"].update(
-                        Panel(
-                            Align.center(create_best_scores_display(), vertical="middle"),
-                            title="[bold]🏆 High Scores 🏆[/bold]",
-                            border_style="green"
-                        )
-                    )
-                    
-                    await asyncio.sleep(0.1)
-                
-                # Wait for workers
-                await asyncio.gather(*workers)
-                
-                # Final stats update
-                layout["stats"].update(
-                    Panel(
-                        Align.center(make_stats_table(), vertical="middle"),
-                        title="[bold]Statistics - Complete[/bold]",
-                        border_style="green"
-                    )
-                )
-                
-                # Final best scores update
-                layout["best_scores"].update(
-                    Panel(
-                        Align.center(create_best_scores_display(), vertical="middle"),
-                        title="[bold]🏆 Final High Scores 🏆[/bold]",
-                        border_style="green"
-                    )
-                )
-                
-                await asyncio.sleep(1)
-        
-        # Convert results dict to list in original order
-        processed_results = [results.get(s.id) for s in samples if s.id in results]
-        
-        # If shutdown was requested, print summary
-        if self._shutdown_requested:
-            console.print(f"\n[yellow]⚠️  Shutdown complete. Processed {len(processed_results)}/{len(samples)} samples[/yellow]")
-        
-        return processed_results
-
+    
     def process_batch(self, samples: List[Sample], compression_ratio: float = 0.6,
                      similarity: float = 0.75, batch_size: int = 5,
                      cooldown: float = 0.5, batch_cooldown: float = 2.0,
@@ -1646,7 +767,8 @@ class HypernymProcessor:
                      force_detail_count: Optional[int] = None,
                      force_single_segment: bool = True,
                      include_embeddings: bool = False,
-                     filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+                     filters: Optional[Dict[str, Any]] = None,
+                     ensemble: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Process multiple samples in batches
         
@@ -1725,7 +847,7 @@ class HypernymProcessor:
                         sample, sample_compression, sample_similarity,
                         sample_timeout, max_retries, use_cache,
                         sample_analysis_mode, force_detail_count, sample_single_segment,
-                        sample_embeddings, sample_filters
+                        sample_embeddings, sample_filters, ensemble
                     )
                 results.append(result)
                 
@@ -1746,7 +868,8 @@ class HypernymProcessor:
                       force_detail_count: Optional[int] = None,
                       force_single_segment: bool = True,
                       include_embeddings: bool = False,
-                      filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                      filters: Optional[Dict[str, Any]] = None,
+                      ensemble: Optional[str] = None) -> Dict[str, Any]:
         """
         Start asynchronous analysis and return task ID.
         
@@ -1793,6 +916,8 @@ class HypernymProcessor:
                 params['timeout'] = timeout
             if include_embeddings:
                 params['include_embeddings'] = include_embeddings
+            if ensemble and self.has_northstar_access():
+                params['ensemble'] = ensemble
             
             payload = {
                 'essay_text': sample.content,
@@ -1813,13 +938,21 @@ class HypernymProcessor:
                 timeout=30  # Short timeout for async initiation
             )
             
-            response.raise_for_status()
+            if response.status_code != 202:
+                raise Exception(f"Failed to start analysis: {response.text}")
+                
             result = response.json()
+            
+            # Extract request_id from metadata
+            request_id = result.get('metadata', {}).get('request_id')
+            if not request_id:
+                raise Exception("No request_id in response")
             
             return {
                 'success': True,
-                'task_id': result.get('task_id'),
-                'status': result.get('status', 'pending')
+                'request_id': request_id,  # Using request_id as per docs
+                'status': result.get('metadata', {}).get('status', 'queued'),
+                'mode': result.get('metadata', {}).get('mode', analysis_mode)
             }
             
         except Exception as e:
@@ -1828,19 +961,19 @@ class HypernymProcessor:
                 'error': str(e)
             }
     
-    def check_async_status(self, task_id: str) -> Dict[str, Any]:
+    def check_async_status(self, request_id: str) -> Dict[str, Any]:
         """
         Check status of asynchronous analysis task.
         
         Args:
-            task_id: Task ID returned by analyze_async
+            request_id: Request ID returned by analyze_async
             
         Returns:
             Dict with status and results:
                 {
                     'success': bool,
-                    'status': str,  # 'pending', 'processing', 'completed', 'failed'
-                    'progress': float,  # 0.0-1.0
+                    'status': str,  # 'queued', 'processing', 'completed', 'failed'
+                    'progress': dict,  # Progress info if processing
                     'result': dict,  # Full result if completed
                     'error': str  # Error message if failed
                 }
@@ -1853,7 +986,7 @@ class HypernymProcessor:
             
             # Make request to analyze_status endpoint
             api_url_base = self.api_url.rsplit('/', 1)[0]
-            status_url = f"{api_url_base}/analyze_status/{task_id}"
+            status_url = f"{api_url_base}/analyze_status/{request_id}"
             
             response = requests.get(
                 status_url,
@@ -1864,13 +997,42 @@ class HypernymProcessor:
             response.raise_for_status()
             result = response.json()
             
-            return {
-                'success': True,
-                'status': result.get('status', 'unknown'),
-                'progress': result.get('progress', 0.0),
-                'result': result.get('result') if result.get('status') == 'completed' else None,
-                'error': result.get('error') if result.get('status') == 'failed' else None
-            }
+            # Check metadata status
+            metadata = result.get('metadata', {})
+            status = metadata.get('status', 'unknown')
+            
+            # Handle different response formats based on status
+            if 'progress' in result:
+                # Still processing - return progress info
+                return {
+                    'success': True,
+                    'status': 'processing',
+                    'progress': result['progress'],  # Contains total_paragraphs, completed_paragraphs, percent_complete
+                    'result': None
+                }
+            elif status == 'completed' or 'response' in result:
+                # Completed - full results available
+                return {
+                    'success': True,
+                    'status': 'completed',
+                    'progress': {'percent_complete': 100},
+                    'result': result  # Full analysis results
+                }
+            elif 'error' in result:
+                # Failed
+                return {
+                    'success': False,
+                    'status': 'failed',
+                    'error': result.get('error', 'Unknown error')
+                }
+            else:
+                # Queued or unknown status
+                return {
+                    'success': True,
+                    'status': status,
+                    'progress': {'percent_complete': 0},
+                    'result': None
+                }
             
         except Exception as e:
             return {
@@ -1887,7 +1049,8 @@ class HypernymProcessor:
                             force_single_segment: bool = True,
                             include_embeddings: bool = False,
                             filters: Optional[Dict[str, Any]] = None,
-                            use_cache: bool = True) -> Dict[str, Any]:
+                            use_cache: bool = True,
+                            ensemble: Optional[str] = None) -> Dict[str, Any]:
         """
         Process sample asynchronously with polling.
         
@@ -1932,7 +1095,7 @@ class HypernymProcessor:
         async_result = self.analyze_async(
             sample, compression_ratio, similarity, timeout,
             analysis_mode, force_detail_count, force_single_segment,
-            include_embeddings, filters
+            include_embeddings, filters, ensemble
         )
         
         if not async_result['success']:
@@ -2359,8 +1522,30 @@ Average processing time: {avg_time:.2f}s (excluding cached)
 Failed Samples
 --------------
 """
+        # Group failed samples by error type
+        content_rejected = []
+        other_failures = []
+        
         for r in failed:
-            report += f"- Sample {r['sample_id']}: {r.get('error', 'Unknown error')}\n"
+            error_msg = r.get('error', 'Unknown error')
+            if '422' in error_msg or 'Content rejected' in error_msg:
+                content_rejected.append(r)
+            else:
+                other_failures.append(r)
+        
+        if content_rejected:
+            report += f"\nContent Rejected (422) - {len(content_rejected)} samples:\n"
+            for r in content_rejected[:5]:  # Show first 5
+                report += f"  - Sample {r['sample_id']}\n"
+            if len(content_rejected) > 5:
+                report += f"  ... and {len(content_rejected) - 5} more\n"
+        
+        if other_failures:
+            report += f"\nOther Errors - {len(other_failures)} samples:\n"
+            for r in other_failures[:10]:  # Show first 10
+                report += f"  - Sample {r['sample_id']}: {r.get('error', 'Unknown error')}\n"
+            if len(other_failures) > 10:
+                report += f"  ... and {len(other_failures) - 10} more\n"
         
         if output_path:
             with open(output_path, 'w') as f:
@@ -2514,7 +1699,26 @@ Failed Samples
         if self._tier_access is not None:
             return self._tier_access
             
-        # TODO: Implement actual tier detection via API
+        # Check tier via rate-limits endpoint
+        try:
+            import requests
+            response = requests.get(
+                f"{self.api_url.replace('/analyze_sync', '/user/rate-limits')}",
+                headers={'X-API-Key': self.api_key},
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                self._tier_access = data.get('tier', 'standard')
+                
+                print(f"✓ API tier: {self._tier_access}")
+                return self._tier_access
+        except Exception as e:
+            print(f"⚠️ Could not check tier: {e}")
+        
+        # Default to standard
+        self._tier_access = 'standard'
+        return self._tier_access
         # For now, try a Northstar-only feature and see if it works
         # Future implementation:
         # - Try comprehensive mode with minimal input
@@ -2727,6 +1931,9 @@ Examples:
     parser.add_argument('--no-single-segment', action='store_true', help='Process paragraphs separately instead of as single segment')
     parser.add_argument('--include-embeddings', action='store_true', help='Include 768D embedding vectors (Northstar only)')
     parser.add_argument('--filters', type=str, help='JSON string with semantic filters to exclude content')
+    parser.add_argument('--ensemble', type=str, 
+                       default=os.environ.get('HYPERNYM_ENSEMBLE', None),
+                       help='Ensemble configuration for Northstar tier (e.g., "auto", "azure", "openai", "claude", or comma-separated list). Defaults to HYPERNYM_ENSEMBLE env var')
     
     # Async processing
     parser.add_argument('--async-mode', dest='async_mode', action='store_true', help='Use async API endpoints with polling')
@@ -2755,6 +1962,16 @@ Examples:
             api_url=args.api_url
         )
         
+        # Check tier and adjust timeout if not explicitly set
+        tier = processor.check_tier_access()
+        if args.timeout == 30 and tier == 'northstar':  # Default value
+            args.timeout = 60
+            print(f"⚡ Using Northstar timeout: {args.timeout}s")
+        
+        # Show ensemble configuration if enabled
+        if args.ensemble and tier == 'northstar':
+            print(f"🎭 Ensemble mode enabled: {args.ensemble}")
+        
         # Signal handling disabled - doesn't work properly with Rich UI
         # def signal_handler(signum, frame):
         #     print("\n[yellow]🛑 Interrupt received, initiating graceful shutdown...[/yellow]")
@@ -2771,43 +1988,148 @@ Examples:
                     cursor.execute(f"SELECT COUNT(*) FROM {args.table} WHERE book_id = ?", (args.book_id,))
                     total_count = cursor.fetchone()[0]
                     
+                    # Count by mode
                     cursor.execute(f"""
-                        SELECT COUNT(DISTINCT s.id) 
+                        SELECT 
+                            COUNT(DISTINCT CASE 
+                                WHEN hr.analysis_mode IS NULL 
+                                OR hr.analysis_mode = 'partial'
+                                THEN s.id 
+                            END) as standard_count,
+                            COUNT(DISTINCT CASE 
+                                WHEN hr.analysis_mode = 'comprehensive'
+                                THEN s.id 
+                            END) as comprehensive_count
                         FROM {args.table} s
-                        INNER JOIN hypernym_responses hr ON s.id = hr.sample_id
+                        LEFT JOIN hypernym_responses hr ON s.id = hr.sample_id
                         WHERE s.book_id = ?
                     """, (args.book_id,))
-                    processed_count = cursor.fetchone()[0]
+                    standard_count, comprehensive_count = cursor.fetchone()
                     
-                    print(f"\n📊 Book {args.book_id}: {processed_count:,} of {total_count:,} chunks already processed ({processed_count/total_count*100:.1f}%)")
+                    # Count content errors for this book
+                    cursor.execute(f"""
+                        SELECT COUNT(*) FROM content_errors ce
+                        JOIN {args.table} s ON ce.sample_id = s.id
+                        WHERE s.book_id = ?
+                    """, (args.book_id,))
+                    content_error_count = cursor.fetchone()[0]
+                    
+                    # Count other errors for this book
+                    cursor.execute(f"""
+                        SELECT COUNT(DISTINCT ee.sample_id) FROM error_entries ee
+                        JOIN {args.table} s ON ee.sample_id = s.id
+                        WHERE s.book_id = ? AND ee.status_code != 422
+                    """, (args.book_id,))
+                    other_error_count = cursor.fetchone()[0]
+                    
+                    print(f"\n📊 Book {args.book_id}: {total_count:,} chunks total")
+                    print(f"   [green]✓ Standard:[/green] {standard_count:,} ({standard_count/total_count*100:.1f}%)")
+                    print(f"   [blue]✓ Comprehensive:[/blue] {comprehensive_count:,} ({comprehensive_count/total_count*100:.1f}%)")
+                    # Show cache hits for current mode only
+                    if args.analysis_mode == 'comprehensive':
+                        print(f"   [yellow]⚡ Cache hits available:[/yellow] {comprehensive_count:,} ({comprehensive_count/total_count*100:.1f}%)")
+                    else:
+                        print(f"   [yellow]⚡ Cache hits available:[/yellow] {standard_count:,} ({standard_count/total_count*100:.1f}%)")
+                    if content_error_count > 0:
+                        print(f"   [red]🚫 Content errors (422):[/red] {content_error_count:,} ({content_error_count/total_count*100:.1f}%) - permanently skipped")
+                    if other_error_count > 0:
+                        print(f"   [orange1]⚠️  Other errors:[/orange1] {other_error_count:,} ({other_error_count/total_count*100:.1f}%) - will retry")
                 else:
                     # Count for entire database
                     cursor.execute(f"SELECT COUNT(*) FROM {args.table}")
                     total_count = cursor.fetchone()[0]
                     
+                    # Count by mode
                     cursor.execute(f"""
-                        SELECT COUNT(DISTINCT s.id) 
+                        SELECT 
+                            COUNT(DISTINCT CASE 
+                                WHEN hr.analysis_mode IS NULL 
+                                OR hr.analysis_mode = 'partial'
+                                THEN s.id 
+                            END) as standard_count,
+                            COUNT(DISTINCT CASE 
+                                WHEN hr.analysis_mode = 'comprehensive'
+                                THEN s.id 
+                            END) as comprehensive_count
                         FROM {args.table} s
-                        INNER JOIN hypernym_responses hr ON s.id = hr.sample_id
+                        LEFT JOIN hypernym_responses hr ON s.id = hr.sample_id
                     """)
-                    processed_count = cursor.fetchone()[0]
+                    standard_count, comprehensive_count = cursor.fetchone()
                     
-                    print(f"\n📊 Database status: {processed_count:,} of {total_count:,} samples already processed ({processed_count/total_count*100:.1f}%)")
+                    # Count content errors for entire database
+                    cursor.execute(f"""
+                        SELECT COUNT(*) FROM content_errors ce
+                        JOIN {args.table} s ON ce.sample_id = s.id
+                    """)
+                    content_error_count = cursor.fetchone()[0]
+                    
+                    # Count other errors for entire database
+                    cursor.execute(f"""
+                        SELECT COUNT(DISTINCT ee.sample_id) FROM error_entries ee
+                        JOIN {args.table} s ON ee.sample_id = s.id
+                        WHERE ee.status_code != 422
+                    """)
+                    other_error_count = cursor.fetchone()[0]
+                    
+                    print(f"\n📊 Database: {total_count:,} samples total")
+                    print(f"   [green]✓ Standard:[/green] {standard_count:,} ({standard_count/total_count*100:.1f}%)")
+                    print(f"   [blue]✓ Comprehensive:[/blue] {comprehensive_count:,} ({comprehensive_count/total_count*100:.1f}%)")
+                    # Show cache hits for current mode only
+                    if args.analysis_mode == 'comprehensive':
+                        print(f"   [yellow]⚡ Cache hits available:[/yellow] {comprehensive_count:,} ({comprehensive_count/total_count*100:.1f}%)")
+                    else:
+                        print(f"   [yellow]⚡ Cache hits available:[/yellow] {standard_count:,} ({standard_count/total_count*100:.1f}%)")
+                    if content_error_count > 0:
+                        print(f"   [red]🚫 Content errors (422):[/red] {content_error_count:,} ({content_error_count/total_count*100:.1f}%) - permanently skipped")
+                    if other_error_count > 0:
+                        print(f"   [orange1]⚠️  Other errors:[/orange1] {other_error_count:,} ({other_error_count/total_count*100:.1f}%) - will retry")
         
         # Get samples based on selection method
         if args.sample_ids:
             sample_ids = [int(sid.strip()) for sid in args.sample_ids.split(',')]
             samples = processor.get_samples_by_ids(sample_ids, args.table)
         elif args.book_id:
-            # Build query to get all samples from the specified book
-            book_query = f"SELECT * FROM {args.table} WHERE book_id = {args.book_id} ORDER BY id"
-            samples = processor.get_samples_by_query(book_query)
+            # Build appropriate query based on processing requirements
+            if not args.include_processed and args.analysis_mode:
+                # Need to filter by analysis_mode - build a specific query
+                if args.skip_errors:
+                    book_query = f"""
+                        SELECT s.* 
+                        FROM {args.table} s
+                        LEFT JOIN hypernym_responses hr ON s.id = hr.sample_id 
+                            AND hr.analysis_mode = '{args.analysis_mode}'
+                        LEFT JOIN (SELECT DISTINCT sample_id FROM error_entries) ee ON s.id = ee.sample_id
+                        LEFT JOIN content_errors ce ON s.id = ce.sample_id
+                        WHERE s.book_id = {args.book_id}
+                          AND hr.sample_id IS NULL  -- No response in this mode
+                          AND ee.sample_id IS NULL  -- No errors either
+                          AND ce.sample_id IS NULL  -- No content errors
+                        ORDER BY s.id
+                    """
+                else:
+                    book_query = f"""
+                        SELECT s.* 
+                        FROM {args.table} s
+                        LEFT JOIN hypernym_responses hr ON s.id = hr.sample_id 
+                            AND hr.analysis_mode = '{args.analysis_mode}'
+                        LEFT JOIN content_errors ce ON s.id = ce.sample_id
+                        WHERE s.book_id = {args.book_id}
+                          AND hr.sample_id IS NULL  -- No response in this mode
+                          AND ce.sample_id IS NULL  -- No content errors
+                        ORDER BY s.id
+                    """
+                samples = processor.get_samples_by_query(book_query)
+            else:
+                # Get all samples from book regardless of processing status
+                book_query = f"SELECT * FROM {args.table} WHERE book_id = {args.book_id} ORDER BY id"
+                samples = processor.get_samples_by_query(book_query)
         elif args.query:
             samples = processor.get_samples_by_query(args.query)
         else:  # --all
             samples = processor.get_all_samples(args.table, args.max_samples, 
                                                unprocessed_only=not args.include_processed,
-                                               skip_errors=args.skip_errors)
+                                               skip_errors=args.skip_errors,
+                                               analysis_mode=args.analysis_mode)
         
         if not samples:
             if args.all and not args.include_processed:
@@ -2818,12 +2140,14 @@ Examples:
         
         
         if args.all and not args.include_processed:
+            mode_text = f" in {args.analysis_mode} mode" if args.analysis_mode else ""
             if args.skip_errors:
-                print(f"📊 Found {len(samples)} never-attempted samples to process (skipping previous errors)")
+                print(f"📊 Found {len(samples)} never-attempted samples to process{mode_text} (skipping previous errors)")
             else:
-                print(f"📊 Found {len(samples)} unprocessed samples to process (never-attempted will be processed before retrying errors)")
+                print(f"📊 Found {len(samples)} unprocessed samples to process{mode_text} (never-attempted will be processed before retrying errors)")
         else:
-            print(f"📊 Found {len(samples)} samples to process")
+            mode_text = f" in {args.analysis_mode} mode" if args.analysis_mode else ""
+            print(f"📊 Found {len(samples)} samples to process{mode_text}")
         
         # Apply max samples limit if specified
         if args.max_samples and len(samples) > args.max_samples:
@@ -2860,7 +2184,8 @@ Examples:
                 force_single_segment=not args.no_single_segment,
                 include_embeddings=args.include_embeddings,
                 filters=filters,
-                max_display_workers=args.max_display_workers
+                max_display_workers=args.max_display_workers,
+                ensemble=args.ensemble
             )
         )
         
