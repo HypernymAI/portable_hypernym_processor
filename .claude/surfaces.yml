@@ -1,0 +1,15 @@
+# Tier-1 surfaces: the paths whose changes the Gates check holds to a stricter bar
+# (a posture check, and a human sign-off before a one-way merge).
+#
+# The entry below is a placeholder. Its path matches no file, so it gates nothing.
+# Replace it with your own surfaces, for example:
+#
+#   auth:
+#     description: Authentication and session handling
+#     paths: ["src/auth/**"]
+#     one_way_unlock: { merge: [adversarial-review] }
+#     ledger: ENG-1   # the issue that holds this surface's audit baseline
+surfaces:
+  example:
+    description: Placeholder that matches no file; replace it with a real surface.
+    paths: ["gates-placeholder-no-such-dir/**"]
